@@ -1400,3 +1400,85 @@ async def show_stats(query, context):
         f"📱 Number Pkgs: {count_products('number')}\n"
         f"🎬 Video Pkgs: {count_products('video')}\n"
         f"👥 Users: {count_users()}\n"
+f"🚫 Blocked: {count_blocked()}\n"
+        f"📞 Pool: {count_total_numbers()}\n"
+        f"🟢 Available: {count_available_numbers()}\n"
+        f"🔴 Assigned: {count_assigned_numbers()}\n"
+        f"🚫 Invalid: {count_invalid_numbers()}\n"
+        f"Active Clients: {len(active_clients)}\n\n"
+        f"📦 Total: {count_orders()}\n"
+        f"⏳ Pending: {count_orders('pending')}\n"
+        f"✅ Approved: {count_orders('approved')}\n"
+        f"❌ Rejected: {count_orders('rejected')}\n"
+    )
+    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
+
+# ===================== HEALTH SERVER =====================
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK")
+    def log_message(self, format, *args): pass
+
+def run_health_server():
+    server = HTTPServer(('0.0.0.0', PORT), HealthHandler)
+    logger.info(f"Health server on port {PORT}")
+    server.serve_forever()
+
+# ===================== MAIN =====================
+_shutdown = False
+
+def signal_handler(sig, frame):
+    global _shutdown
+    _shutdown = True
+    logger.info("Shutdown signal received")
+
+async def main():
+    # Initialize database
+    init_db()
+    
+    # Start health server in a separate thread
+    health_thread = threading.Thread(target=run_health_server, daemon=True)
+    health_thread.start()
+    
+    # Set up the bot application
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Register handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(button_callback))
+    application.add_handler(MessageHandler(filters.ALL, handle_messages))
+    
+    # Start number clients
+    await start_all_number_clients()
+    
+    # Start the bot
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling()
+    
+    logger.info("✅ Bot is running!")
+    
+    # Keep alive
+    while not _shutdown:
+        await asyncio.sleep(1)
+    
+    # Cleanup
+    logger.info("Shutting down...")
+    await stop_all_number_clients()
+    await application.updater.stop()
+    await application.stop()
+    await application.shutdown()
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        logger.info("Bot stopped.")
