@@ -4,6 +4,7 @@ import logging
 import os
 import threading
 import random
+import asyncio
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
@@ -270,7 +271,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ You have been blocked.")
         return
     
-    # User buttons
     keyboard = [
         [InlineKeyboardButton("📱 Buy Number", callback_data="buy_number")],
         [InlineKeyboardButton("🎬 Buy Video", callback_data="buy_video")],
@@ -881,9 +881,10 @@ def run_health_server():
     logger.info(f"Health server running on port {PORT}")
     server.serve_forever()
 
-# ===================== MAIN =====================
+# ===================== FIXED MAIN (Python 3.14 compatible) =====================
 
-def main():
+async def run_bot():
+    """Async function to run the bot"""
     init_db()
     logger.info("Database initialized")
     
@@ -895,9 +896,42 @@ def main():
     app.add_handler(MessageHandler(filters.ALL, handle_messages))
     
     logger.info("Bot started successfully!")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    
+    # Use start_polling() directly without run_polling() which calls get_event_loop()
+    await app.initialize()
+    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+    await app.start()
+    
+    # Keep running
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+
+def main():
+    """Main entry point"""
+    # Create and set event loop for Python 3.14 compatibility
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(run_bot())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    finally:
+        try:
+            loop.close()
+        except:
+            pass
 
 if __name__ == "__main__":
+    # Start health server in daemon thread
     health_thread = threading.Thread(target=run_health_server, daemon=True)
     health_thread.start()
+    
+    # Run the bot with proper asyncio setup
     main()
