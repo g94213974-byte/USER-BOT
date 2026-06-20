@@ -296,17 +296,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     keyboard = [
-        [InlineKeyboardButton("📱 Buy Number", callback_data="buy_number")],
-        [InlineKeyboardButton("🎬 Buy Video", callback_data="buy_video")],
+        [InlineKeyboardButton("🔞 Buy Premium Videos", callback_data="buy_video")],
+        [InlineKeyboardButton("🇮🇳 Buy Number", callback_data="buy_number")],
         [InlineKeyboardButton("📖 How To Use", callback_data="how_to_use")]
     ]
     if user.id in ADMIN_IDS:
         keyboard.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin_panel")])
     
     welcome_text = (
-        "👋 **Welcome to the Bot!**\n\n"
-        "📱 Buy virtual numbers\n"
-        "🎬 Buy premium videos\n"
+        "👋 **Welcome back!**\n\n"
+        "🇮🇳 Buy virtual numbers\n"
+        "🔞 Buy premium videos\n"
         "📖 Learn how to use\n\n"
         "Select an option below:"
     )
@@ -459,7 +459,7 @@ async def show_number_products(query, context):
         await safe_edit(query, "❌ No number packages available yet.", 
                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_main")]]))
         return
-    text = "📱 **Number Packages**\n\nSelect a package below:"
+    text = "🇮🇳 **Number Packages**\n\nSelect a package below:"
     keyboard = []
     row = []
     for p in products:
@@ -479,7 +479,7 @@ async def show_video_products(query, context):
         await safe_edit(query, "❌ No video packages available yet.", 
                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_main")]]))
         return
-    text = "🎬 **Video Packages**\n\nSelect a package below:"
+    text = "🔞 **Premium Video Packages**\n\nSelect a package below:"
     keyboard = []
     row = []
     for p in products:
@@ -607,7 +607,7 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             price = context.user_data.get("new_num_price", 0)
             add_product("number", name, price, qty)
             context.user_data["waiting_for_num_qty"] = False
-            await update.message.reply_text(f"✅ **Number package added!**\n\n📱 {name}\n💰 ₹{price}\n📦 Qty: {qty}")
+            await update.message.reply_text(f"✅ **Number package added!**\n\n🇮🇳 {name}\n💰 ₹{price}\n📦 Qty: {qty}")
         except ValueError:
             await update.message.reply_text("❌ Invalid quantity! Send a number like `5`.\n\n❌ /cancel to cancel")
         return
@@ -647,7 +647,7 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         price = context.user_data.get("new_vid_price", 0)
         add_product("video", name, price, link)
         context.user_data["waiting_for_vid_link"] = False
-        await update.message.reply_text(f"✅ **Video package added!**\n\n🎬 {name}\n💰 ₹{price}\n🔗 {link}")
+        await update.message.reply_text(f"✅ **Video package added!**\n\n🔞 {name}\n💰 ₹{price}\n🔗 {link}")
         return
     
     # ===== ADMIN: SET UPI ID =====
@@ -707,7 +707,7 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 async def notify_admins(context, user, product, screenshot_id, p_type, order_id):
-    pkg_emoji = "📱" if p_type == "number" else "🎬"
+    pkg_emoji = "🇮🇳" if p_type == "number" else "🔞"
     text = (
         f"\n{pkg_emoji} **New Order Received!**\n\n"
         f"👤 Name: {user.first_name}\n"
@@ -729,7 +729,7 @@ async def notify_admins(context, user, product, screenshot_id, p_type, order_id)
             logger.error(f"Could not notify admin {admin_id}: {e}")
 
 async def approve_order(query, context, order_id):
-    """FIXED: Uses customizable approval message instead of random numbers."""
+    """Uses customizable approval message instead of random numbers."""
     order = get_order(order_id)
     if not order:
         await safe_edit(query, "❌ Order not found.")
@@ -746,7 +746,6 @@ async def approve_order(query, context, order_id):
     
     # If it's a video order and has a delivery link, append it
     if order["type"] == "video" and order.get("delivery_link"):
-        # Check if the template already has {delivery_link} placeholder used
         if "{delivery_link}" not in approval_template:
             approval_text += f"\n\n🔗 **Access Link:**\n{order['delivery_link']}"
     
@@ -754,7 +753,6 @@ async def approve_order(query, context, order_id):
         await context.bot.send_message(chat_id=user_id, text=approval_text, parse_mode='Markdown')
     except Exception as e:
         logger.error(f"Could not send approval to user {user_id}: {e}")
-        # Fallback without markdown if parsing fails
         try:
             await context.bot.send_message(chat_id=user_id, text=approval_text)
         except Exception as e2:
@@ -786,8 +784,8 @@ async def block_user_from_order(query, context, order_id):
 
 async def back_to_main(query, context):
     keyboard = [
-        [InlineKeyboardButton("📱 Buy Number", callback_data="buy_number")],
-        [InlineKeyboardButton("🎬 Buy Video", callback_data="buy_video")],
+        [InlineKeyboardButton("🔞 Buy Premium Videos", callback_data="buy_video")],
+        [InlineKeyboardButton("🇮🇳 Buy Number", callback_data="buy_number")],
         [InlineKeyboardButton("📖 How To Use", callback_data="how_to_use")]
     ]
     if query.from_user.id in ADMIN_IDS:
@@ -800,8 +798,8 @@ async def back_to_main(query, context):
     
     welcome_text = (
         "👋 **Welcome back!**\n\n"
-        "📱 Buy virtual numbers\n"
-        "🎬 Buy premium videos\n"
+        "🇮🇳 Buy virtual numbers\n"
+        "🔞 Buy premium videos\n"
         "📖 Learn how to use\n\n"
         "Select an option below:"
     )
@@ -817,8 +815,8 @@ async def show_admin_panel(query, context):
     if query.from_user.id not in ADMIN_IDS:
         return
     keyboard = [
-        [InlineKeyboardButton("📱 Number Products", callback_data="admin_numbers"), 
-         InlineKeyboardButton("🎬 Video Products", callback_data="admin_videos")],
+        [InlineKeyboardButton("🇮🇳 Number Products", callback_data="admin_numbers"), 
+         InlineKeyboardButton("🔞 Video Products", callback_data="admin_videos")],
         [InlineKeyboardButton("💳 Payment Settings", callback_data="admin_payment"), 
          InlineKeyboardButton("📷 QR Code", callback_data="admin_qr")],
         [InlineKeyboardButton("📖 HowTo Video", callback_data="admin_howto")],
@@ -848,7 +846,7 @@ async def show_admin_approval_message(query, context):
         f"`{{price}}` — Amount paid\n"
         f"`{{quantity}}` — Quantity\n"
         f"`{{delivery_link}}` — Link (videos)\n"
-        f"`{{type}}` — 📱 or 🎬\n"
+        f"`{{type}}` — 🇮🇳 or 🔞\n"
         f"`{{order_id}}` — Order ID\n\n"
         f"Tap below to change the message."
     )
@@ -862,7 +860,7 @@ async def admin_number_products(query, context):
     if query.from_user.id not in ADMIN_IDS:
         return
     products = get_products("number")
-    text = "📱 **Number Packages**\n\n"
+    text = "🇮🇳 **Number Packages**\n\n"
     if not products:
         text += "No packages yet.\n"
     else:
@@ -886,7 +884,7 @@ async def admin_video_products(query, context):
     if query.from_user.id not in ADMIN_IDS:
         return
     products = get_products("video")
-    text = "🎬 **Video Packages**\n\n"
+    text = "🔞 **Video Packages**\n\n"
     if not products:
         text += "No packages yet.\n"
     else:
@@ -996,8 +994,8 @@ async def show_stats(query, context):
         return
     text = (
         f"📊 **Bot Statistics**\n\n"
-        f"📱 Number Packages: {count_products('number')}\n"
-        f"🎬 Video Packages: {count_products('video')}\n"
+        f"🇮🇳 Number Packages: {count_products('number')}\n"
+        f"🔞 Video Packages: {count_products('video')}\n"
         f"👥 Total Users: {count_users()}\n"
         f"🚫 Blocked: {count_blocked()}\n\n"
         f"📦 **Orders:**\n"
