@@ -34,7 +34,7 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT, name TEXT, price REAL, quantity INTEGER DEFAULT 1, delivery_link TEXT DEFAULT '', position INTEGER)''')
     c.execute('''CREATE TABLE IF NOT EXISTS blocked_users (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, first_name TEXT, username TEXT, blocked_at TEXT)''')
     
-    defaults = {"upi_id": "customupi@bank", "qr_code": "", "how_to_use_video": "", "number_buttons_position": "vertical", "video_buttons_position": "vertical"}
+    defaults = {"upi_id": "customupi@bank", "qr_code": "", "how_to_use_video": "", "number_buttons_position": "horizontal", "video_buttons_position": "horizontal"}
     for k, v in defaults.items():
         c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, str(v)))
     conn.commit()
@@ -58,8 +58,7 @@ def update_setting(key, value):
 def save_user(user_id, first_name, username):
     conn = get_db()
     c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO users (user_id, first_name, username, last_interaction) VALUES (?, ?, ?, ?)",
-              (user_id, first_name, username, datetime.datetime.now().isoformat()))
+    c.execute("INSERT OR REPLACE INTO users (user_id, first_name, username, last_interaction) VALUES (?, ?, ?, ?)", (user_id, first_name, username, datetime.datetime.now().isoformat()))
     conn.commit()
     conn.close()
 
@@ -117,8 +116,7 @@ def count_products(type_name):
 def create_order(user_id, first_name, username, p_type, package_id, package_name, price, quantity, delivery_link, screenshot_id):
     conn = get_db()
     c = conn.cursor()
-    c.execute('''INSERT INTO orders (user_id, first_name, username, type, package_id, package_name, price, quantity, delivery_link, screenshot_file_id, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)''',
-              (user_id, first_name, username, p_type, str(package_id), package_name, price, quantity, delivery_link, screenshot_id, datetime.datetime.now().isoformat()))
+    c.execute('''INSERT INTO orders (user_id, first_name, username, type, package_id, package_name, price, quantity, delivery_link, screenshot_file_id, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)''', (user_id, first_name, username, p_type, str(package_id), package_name, price, quantity, delivery_link, screenshot_id, datetime.datetime.now().isoformat()))
     order_id = c.lastrowid
     conn.commit()
     conn.close()
@@ -196,6 +194,7 @@ def count_blocked():
     c.execute("SELECT COUNT(*) FROM blocked_users")
     return c.fetchone()[0]
 
+# ===================== FIX: Safe edit =====================
 async def safe_edit(query, text, reply_markup=None):
     try:
         await query.edit_message_text(text, reply_markup=reply_markup)
@@ -210,13 +209,19 @@ async def safe_edit_caption(query, caption, reply_markup=None):
         if "Message is not modified" not in str(e):
             raise e
 
+# ===================== HANDLERS =====================
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     save_user(user.id, user.first_name, user.username)
     if is_blocked(user.id):
         await update.message.reply_text("⛔ You have been blocked.")
         return
-    keyboard = [[InlineKeyboardButton("📱 Buy Number", callback_data="buy_number")], [InlineKeyboardButton("🎬 Buy Video", callback_data="buy_video")], [InlineKeyboardButton("📖 How To Use", callback_data="how_to_use")]]
+    keyboard = [
+        [InlineKeyboardButton("📱 Buy Number", callback_data="buy_number")],
+        [InlineKeyboardButton("🎬 Buy Video", callback_data="buy_video")],
+        [InlineKeyboardButton("📖 How To Use", callback_data="how_to_use")]
+    ]
     if user.id in ADMIN_IDS:
         keyboard.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin_panel")])
     await update.message.reply_text("👋 Welcome! Please select an option:", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -229,6 +234,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit(query, "⛔ You have been blocked.")
         return
     data = query.data
+    
     if data == "how_to_use":
         await show_how_to_use(query, context)
     elif data == "buy_number":
@@ -267,6 +273,18 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit(query, "✅ User has been unblocked.")
     elif data == "admin_panel":
         await show_admin_panel(query, context)
+    # NEW: Delete product via button
+    elif data.startswith("del_product_"):
+        if query.from_user.id in ADMIN_IDS:
+            product_id = int(data.replace("del_product_", ""))
+            product = get_product(product_id)
+            delete_product(product_id)
+            await safe_edit(query, f"✅ Product '{product['name'] if product else ''}' (ID: {product_id}) deleted!")
+            # Show updated list
+            if product and product['type'] == 'number':
+                await admin_number_products(query, context)
+            elif product and product['type'] == 'video':
+                await admin_video_products(query, context)
     elif data == "admin_numbers":
         await admin_number_products(query, context)
     elif data == "admin_videos":
@@ -305,17 +323,13 @@ async def show_number_products(query, context):
         await safe_edit(query, "❌ No number packages available yet.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_main")]]))
         return
     keyboard = []
-    position = get_setting("number_buttons_position") or "vertical"
     row = []
     for p in products:
         btn = InlineKeyboardButton(f"{p['name']} - ₹{p['price']}", callback_data=f"num_pkg_{p['id']}")
-        if position == "horizontal":
-            row.append(btn)
-            if len(row) == 2:
-                keyboard.append(row)
-                row = []
-        else:
-            keyboard.append([btn])
+        row.append(btn)
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
     if row:
         keyboard.append(row)
     keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_main")])
@@ -327,17 +341,13 @@ async def show_video_products(query, context):
         await safe_edit(query, "❌ No video packages available yet.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_main")]]))
         return
     keyboard = []
-    position = get_setting("video_buttons_position") or "vertical"
     row = []
     for p in products:
         btn = InlineKeyboardButton(f"{p['name']} - ₹{p['price']}", callback_data=f"vid_pkg_{p['id']}")
-        if position == "horizontal":
-            row.append(btn)
-            if len(row) == 2:
-                keyboard.append(row)
-                row = []
-        else:
-            keyboard.append([btn])
+        row.append(btn)
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
     if row:
         keyboard.append(row)
     keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_main")])
@@ -393,7 +403,7 @@ async def handle_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def notify_admins(context, user, product, screenshot_id, p_type, order_id):
     pkg_emoji = "📱" if p_type == "number" else "🎬"
     text = f"\n{pkg_emoji} New Order Received!\n\n👤 Name: {user.first_name}\n🆔 User ID: {user.id}\n📛 Username: @{user.username if user.username else 'N/A'}\n\n📦 Package: {product['name']}\n💰 Price: ₹{product['price']}\n"
-    keyboard = [[InlineKeyboardButton("✅ APPROVED", callback_data=f"approve_{order_id}"), InlineKeyboardButton("❌ REJECT", callback_data=f"reject_{order_id}")], [InlineKeyboardButton("🚫 BLOCK", callback_data=f"block_{order_id}")]]
+    keyboard = [[InlineKeyboardButton("✅ APPROVE", callback_data=f"approve_{order_id}"), InlineKeyboardButton("❌ REJECT", callback_data=f"reject_{order_id}")], [InlineKeyboardButton("🚫 BLOCK", callback_data=f"block_{order_id}")]]
     for admin_id in ADMIN_IDS:
         try:
             await context.bot.send_photo(chat_id=admin_id, photo=screenshot_id, caption=text, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -416,14 +426,13 @@ async def approve_order(query, context, order_id):
         try:
             await context.bot.send_message(chat_id=user_id, text=text)
         except Exception as e:
-            logger.error(f"Could not send to user {user_id}: {e}")
+            logger.error(f"Could not send: {e}")
     elif order["type"] == "video":
-        link = order.get("delivery_link", "")
         try:
-            await context.bot.send_message(chat_id=user_id, text=f"✅ Payment Approved!\n\n🔗 Access Link:\n\n{link}")
+            await context.bot.send_message(chat_id=user_id, text=f"✅ Payment Approved!\n\n🔗 Access Link:\n\n{order.get('delivery_link', '')}")
         except Exception as e:
-            logger.error(f"Could not send to user {user_id}: {e}")
-    await safe_edit_caption(query, caption=f"✅ Order Approved!\n\nPackage: {order['package_name']}\nPrice: ₹{order['price']}\nUser: {order['first_name']}")
+            logger.error(f"Could not send: {e}")
+    await safe_edit_caption(query, caption=f"✅ Order Approved!\n\n{order['package_name']}\n₹{order['price']}\nUser: {order['first_name']}")
 
 async def reject_order(query, context, order_id):
     order = get_order(order_id)
@@ -432,10 +441,10 @@ async def reject_order(query, context, order_id):
         return
     update_order_status(order_id, "rejected")
     try:
-        await context.bot.send_message(chat_id=order["user_id"], text="❌ Payment rejected.\nPlease contact support.")
-    except Exception as e:
-        logger.error(f"Could not send to user: {e}")
-    await safe_edit_caption(query, caption=f"❌ Order Rejected!\n\nPackage: {order['package_name']}\nPrice: ₹{order['price']}\nUser: {order['first_name']}")
+        await context.bot.send_message(chat_id=order["user_id"], text="❌ Payment rejected.\nContact support.")
+    except:
+        pass
+    await safe_edit_caption(query, caption=f"❌ Rejected!\n{order['package_name']}\nUser: {order['first_name']}")
 
 async def block_user_from_order(query, context, order_id):
     order = get_order(order_id)
@@ -444,18 +453,32 @@ async def block_user_from_order(query, context, order_id):
         return
     block_user(order["user_id"], order["first_name"], order.get("username", ""))
     update_order_status(order_id, "blocked")
-    await safe_edit_caption(query, caption=f"🚫 User Blocked!\n\nName: {order['first_name']}\nUser ID: {order['user_id']}")
+    await safe_edit_caption(query, caption=f"🚫 Blocked!\n{order['first_name']} (ID: {order['user_id']})")
 
 async def back_to_main(query, context):
-    keyboard = [[InlineKeyboardButton("📱 Buy Number", callback_data="buy_number")], [InlineKeyboardButton("🎬 Buy Video", callback_data="buy_video")], [InlineKeyboardButton("📖 How To Use", callback_data="how_to_use")]]
+    keyboard = [
+        [InlineKeyboardButton("📱 Buy Number", callback_data="buy_number")],
+        [InlineKeyboardButton("🎬 Buy Video", callback_data="buy_video")],
+        [InlineKeyboardButton("📖 How To Use", callback_data="how_to_use")]
+    ]
     if query.from_user.id in ADMIN_IDS:
         keyboard.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin_panel")])
     await safe_edit(query, "👋 Welcome! Please select an option:", reply_markup=InlineKeyboardMarkup(keyboard))
 
+# ===================== ADMIN PANEL (FIXED: Horizontal buttons & Delete buttons) =====================
+
 async def show_admin_panel(query, context):
     if query.from_user.id not in ADMIN_IDS:
         return
-    keyboard = [[InlineKeyboardButton("📱 Number Products", callback_data="admin_numbers")], [InlineKeyboardButton("🎬 Video Products", callback_data="admin_videos")], [InlineKeyboardButton("💳 Payment Settings", callback_data="admin_payment")], [InlineKeyboardButton("📷 QR Code Settings", callback_data="admin_qr")], [InlineKeyboardButton("📖 How To Use Video", callback_data="admin_howto")], [InlineKeyboardButton("📦 Pending Orders", callback_data="admin_pending")], [InlineKeyboardButton("✅ Approved Orders", callback_data="admin_approved")], [InlineKeyboardButton("❌ Rejected Orders", callback_data="admin_rejected")], [InlineKeyboardButton("🚫 Blocked Users", callback_data="admin_blocked")], [InlineKeyboardButton("👥 Users", callback_data="admin_users")], [InlineKeyboardButton("📊 Statistics", callback_data="admin_stats")], [InlineKeyboardButton("🔙 Back", callback_data="back_main")]]
+    keyboard = [
+        [InlineKeyboardButton("📱 Number Products", callback_data="admin_numbers"), InlineKeyboardButton("🎬 Video Products", callback_data="admin_videos")],
+        [InlineKeyboardButton("💳 Payment", callback_data="admin_payment"), InlineKeyboardButton("📷 QR Code", callback_data="admin_qr")],
+        [InlineKeyboardButton("📖 HowTo Video", callback_data="admin_howto"), InlineKeyboardButton("📦 Pending", callback_data="admin_pending")],
+        [InlineKeyboardButton("✅ Approved", callback_data="admin_approved"), InlineKeyboardButton("❌ Rejected", callback_data="admin_rejected")],
+        [InlineKeyboardButton("🚫 Blocked", callback_data="admin_blocked"), InlineKeyboardButton("👥 Users", callback_data="admin_users")],
+        [InlineKeyboardButton("📊 Stats", callback_data="admin_stats")],
+        [InlineKeyboardButton("🔙 Back", callback_data="back_main")]
+    ]
     await safe_edit(query, "⚙️ Admin Panel\n\nChoose an option:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def admin_number_products(query, context):
@@ -467,9 +490,20 @@ async def admin_number_products(query, context):
         text += "No packages yet.\n"
     else:
         for p in products:
-            text += f"• {p['name']} - ₹{p['price']} ({p.get('quantity', 1)} numbers)\n  ID: {p['id']}\n\n"
-    text += "\nCommands:\n/add_number [name] [price] [quantity]\n/del_product [id]\n/pos_number [vertical/horizontal]"
-    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
+            text += f"• {p['name']} - ₹{p['price']} ({p.get('quantity', 1)} nos) — ID: {p['id']}\n"
+    text += "\nCommands:\n/add_number [name] [price] [quantity]"
+    
+    keyboard = []
+    row = []
+    for p in products:
+        row.append(InlineKeyboardButton(f"🗑️ Del #{p['id']}", callback_data=f"del_product_{p['id']}"))
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="admin_panel")])
+    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def admin_video_products(query, context):
     if query.from_user.id not in ADMIN_IDS:
@@ -480,14 +514,25 @@ async def admin_video_products(query, context):
         text += "No packages yet.\n"
     else:
         for p in products:
-            text += f"• {p['name']} - ₹{p['price']}\n  Link: {p.get('delivery_link', 'N/A')}\n  ID: {p['id']}\n\n"
-    text += "\nCommands:\n/add_video [name] [price] [link]\n/del_product [id]\n/pos_video [vertical/horizontal]"
-    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
+            text += f"• {p['name']} - ₹{p['price']} — ID: {p['id']}\n  Link: {p.get('delivery_link', 'N/A')}\n"
+    text += "\nCommands:\n/add_video [name] [price] [link]"
+    
+    keyboard = []
+    row = []
+    for p in products:
+        row.append(InlineKeyboardButton(f"🗑️ Del #{p['id']}", callback_data=f"del_product_{p['id']}"))
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="admin_panel")])
+    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def show_admin_payment(query, context):
     if query.from_user.id not in ADMIN_IDS:
         return
-    await safe_edit(query, f"💳 Payment Settings\n\n🏦 Current UPI ID: {get_setting('upi_id') or 'customupi@bank'}\n\nTo change UPI ID:\n/set_upi [new_upi_id]", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
+    await safe_edit(query, f"💳 Payment Settings\n\n🏦 UPI ID: {get_setting('upi_id') or 'customupi@bank'}\n\nTo change:\n/set_upi [new_upi_id]", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
 
 async def show_admin_qr(query, context):
     if query.from_user.id not in ADMIN_IDS:
@@ -495,7 +540,7 @@ async def show_admin_qr(query, context):
     qr = get_setting("qr_code")
     text = "📷 QR Code Settings\n\n"
     text += "✅ QR Code is set.\n" if qr else "❌ No QR Code set.\n"
-    text += "\nTo set QR Code:\nReply to a photo with /set_qr"
+    text += "\nTo set: Reply to a photo with /set_qr"
     await safe_edit(query, text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
 
 async def show_admin_howto(query, context):
@@ -504,7 +549,7 @@ async def show_admin_howto(query, context):
     vid = get_setting("how_to_use_video")
     text = "📖 How To Use Video\n\n"
     text += "✅ Video is set.\n" if vid else "❌ No video set.\n"
-    text += "\nTo set video:\nReply to a video with /set_howto"
+    text += "\nTo set: Reply to a video with /set_howto"
     await safe_edit(query, text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
 
 async def show_admin_orders(query, context, status):
@@ -530,26 +575,31 @@ async def show_blocked_users(query, context):
         await safe_edit(query, text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
         return
     keyboard = []
+    row = []
+    for b in blocked:
+        row.append(InlineKeyboardButton(f"🔓 {b['first_name']}", callback_data=f"unblock_{b['id']}"))
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="admin_panel")])
     for b in blocked:
         text += f"• {b['first_name']} (@{b.get('username', 'N/A')}) - ID: {b['user_id']}\n"
-        keyboard.append([InlineKeyboardButton(f"🔓 Unblock {b['first_name']}", callback_data=f"unblock_{b['id']}")])
-    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="admin_panel")])
     await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def show_users(query, context):
     if query.from_user.id not in ADMIN_IDS:
         return
-    total = count_users()
-    recent = get_recent_users(10)
-    text = f"👥 Total Users: {total}\n\nRecent Users:\n"
-    for u in recent:
+    text = f"👥 Total Users: {count_users()}\n\nRecent Users:\n"
+    for u in get_recent_users(10):
         text += f"• {u['first_name']} (@{u.get('username', 'N/A')})\n"
     await safe_edit(query, text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
 
 async def show_stats(query, context):
     if query.from_user.id not in ADMIN_IDS:
         return
-    text = f"\n📊 Statistics\n\n📱 Number Packages: {count_products('number')}\n🎬 Video Packages: {count_products('video')}\n👥 Total Users: {count_users()}\n🚫 Blocked Users: {count_blocked()}\n\n📦 Total Orders: {count_orders()}\n⏳ Pending: {count_orders('pending')}\n✅ Approved: {count_orders('approved')}\n❌ Rejected: {count_orders('rejected')}\n"
+    text = f"\n📊 Statistics\n\n📱 Number Packages: {count_products('number')}\n🎬 Video Packages: {count_products('video')}\n👥 Total Users: {count_users()}\n🚫 Blocked: {count_blocked()}\n\n📦 Orders: {count_orders()}\n⏳ Pending: {count_orders('pending')}\n✅ Approved: {count_orders('approved')}\n❌ Rejected: {count_orders('rejected')}\n"
     await safe_edit(query, text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
 
 # ===================== ADMIN COMMANDS =====================
@@ -639,6 +689,7 @@ async def set_position(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update_setting("video_buttons_position", pos)
         await update.message.reply_text(f"✅ Video buttons position: {pos}")
 
+# ===================== HEALTH SERVER =====================
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -651,6 +702,7 @@ class HealthHandler(BaseHTTPRequestHandler):
 def run_health_server():
     HTTPServer(('0.0.0.0', PORT), HealthHandler).serve_forever()
 
+# ===================== MAIN =====================
 def main():
     init_db()
     app = Application.builder().token(BOT_TOKEN).build()
