@@ -194,7 +194,6 @@ def count_blocked():
     c.execute("SELECT COUNT(*) FROM blocked_users")
     return c.fetchone()[0]
 
-# ===================== FIX: Safe edit =====================
 async def safe_edit(query, text, reply_markup=None):
     try:
         await query.edit_message_text(text, reply_markup=reply_markup)
@@ -209,8 +208,7 @@ async def safe_edit_caption(query, caption, reply_markup=None):
         if "Message is not modified" not in str(e):
             raise e
 
-# ===================== HANDLERS =====================
-
+# ===================== START =====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     save_user(user.id, user.first_name, user.username)
@@ -226,6 +224,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin_panel")])
     await update.message.reply_text("👋 Welcome! Please select an option:", reply_markup=InlineKeyboardMarkup(keyboard))
 
+# ===================== BUTTON HANDLER =====================
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -273,17 +272,16 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit(query, "✅ User has been unblocked.")
     elif data == "admin_panel":
         await show_admin_panel(query, context)
-    # NEW: Delete product via button
     elif data.startswith("del_product_"):
         if query.from_user.id in ADMIN_IDS:
-            product_id = int(data.replace("del_product_", ""))
-            product = get_product(product_id)
-            delete_product(product_id)
-            await safe_edit(query, f"✅ Product '{product['name'] if product else ''}' (ID: {product_id}) deleted!")
-            # Show updated list
-            if product and product['type'] == 'number':
+            pid = int(data.replace("del_product_", ""))
+            p = get_product(pid)
+            delete_product(pid)
+            msg = f"✅ Product '{p['name'] if p else ''}' (ID: {pid}) deleted!"
+            await safe_edit(query, msg)
+            if p and p['type'] == 'number':
                 await admin_number_products(query, context)
-            elif product and product['type'] == 'video':
+            elif p and p['type'] == 'video':
                 await admin_video_products(query, context)
     elif data == "admin_numbers":
         await admin_number_products(query, context)
@@ -307,7 +305,15 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_users(query, context)
     elif data == "admin_stats":
         await show_stats(query, context)
+    elif data.startswith("set_upi_"):
+        if query.from_user.id in ADMIN_IDS:
+            upi = data.replace("set_upi_", "")
+            update_setting("upi_id", upi)
+            await safe_edit(query, f"✅ UPI ID updated to: {upi}")
+    elif data == "admin_back_panel":
+        await show_admin_panel(query, context)
 
+# ===================== USER FACING =====================
 async def show_how_to_use(query, context):
     video_id = get_setting("how_to_use_video")
     if video_id:
@@ -325,8 +331,7 @@ async def show_number_products(query, context):
     keyboard = []
     row = []
     for p in products:
-        btn = InlineKeyboardButton(f"{p['name']} - ₹{p['price']}", callback_data=f"num_pkg_{p['id']}")
-        row.append(btn)
+        row.append(InlineKeyboardButton(f"{p['name']} - ₹{p['price']}", callback_data=f"num_pkg_{p['id']}"))
         if len(row) == 2:
             keyboard.append(row)
             row = []
@@ -343,8 +348,7 @@ async def show_video_products(query, context):
     keyboard = []
     row = []
     for p in products:
-        btn = InlineKeyboardButton(f"{p['name']} - ₹{p['price']}", callback_data=f"vid_pkg_{p['id']}")
-        row.append(btn)
+        row.append(InlineKeyboardButton(f"{p['name']} - ₹{p['price']}", callback_data=f"vid_pkg_{p['id']}"))
         if len(row) == 2:
             keyboard.append(row)
             row = []
@@ -416,23 +420,22 @@ async def approve_order(query, context, order_id):
         await safe_edit(query, "❌ Order not found.")
         return
     update_order_status(order_id, "approved")
-    user_id = order["user_id"]
     if order["type"] == "number":
-        quantity = order.get("quantity", 1)
-        text = "✅ Payment Approved!\n\n📱 Your Numbers:\n\n"
-        for i in range(quantity):
-            text += f"{i+1}. +9112345{random.randint(10000, 99999)}\n"
-        text += "\n❤️ Thank you!\nKeep 2-Step Verification ON. 🔒"
+        qty = order.get("quantity", 1)
+        txt = "✅ Payment Approved!\n\n📱 Your Numbers:\n\n"
+        for i in range(qty):
+            txt += f"{i+1}. +9112345{random.randint(10000, 99999)}\n"
+        txt += "\n❤️ Thank you!\nKeep 2-Step Verification ON. 🔒"
         try:
-            await context.bot.send_message(chat_id=user_id, text=text)
-        except Exception as e:
-            logger.error(f"Could not send: {e}")
+            await context.bot.send_message(chat_id=order["user_id"], text=txt)
+        except:
+            pass
     elif order["type"] == "video":
         try:
-            await context.bot.send_message(chat_id=user_id, text=f"✅ Payment Approved!\n\n🔗 Access Link:\n\n{order.get('delivery_link', '')}")
-        except Exception as e:
-            logger.error(f"Could not send: {e}")
-    await safe_edit_caption(query, caption=f"✅ Order Approved!\n\n{order['package_name']}\n₹{order['price']}\nUser: {order['first_name']}")
+            await context.bot.send_message(chat_id=order["user_id"], text=f"✅ Payment Approved!\n\n🔗 Access Link:\n\n{order.get('delivery_link', '')}")
+        except:
+            pass
+    await safe_edit_caption(query, caption=f"✅ Approved!\n{order['package_name']}\n₹{order['price']}\nUser: {order['first_name']}")
 
 async def reject_order(query, context, order_id):
     order = get_order(order_id)
@@ -465,8 +468,7 @@ async def back_to_main(query, context):
         keyboard.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin_panel")])
     await safe_edit(query, "👋 Welcome! Please select an option:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-# ===================== ADMIN PANEL (FIXED: Horizontal buttons & Delete buttons) =====================
-
+# ===================== ADMIN PANEL =====================
 async def show_admin_panel(query, context):
     if query.from_user.id not in ADMIN_IDS:
         return
@@ -491,8 +493,7 @@ async def admin_number_products(query, context):
     else:
         for p in products:
             text += f"• {p['name']} - ₹{p['price']} ({p.get('quantity', 1)} nos) — ID: {p['id']}\n"
-    text += "\nCommands:\n/add_number [name] [price] [quantity]"
-    
+    text += "\nAdd: /add_number Name Price Qty\n(Example: /add_number 5_Numbers 80 5)"
     keyboard = []
     row = []
     for p in products:
@@ -515,8 +516,7 @@ async def admin_video_products(query, context):
     else:
         for p in products:
             text += f"• {p['name']} - ₹{p['price']} — ID: {p['id']}\n  Link: {p.get('delivery_link', 'N/A')}\n"
-    text += "\nCommands:\n/add_video [name] [price] [link]"
-    
+    text += "\nAdd: /add_video Name Price Link\n(Example: /add_video Fast 50 t.me/link)"
     keyboard = []
     row = []
     for p in products:
@@ -532,7 +532,10 @@ async def admin_video_products(query, context):
 async def show_admin_payment(query, context):
     if query.from_user.id not in ADMIN_IDS:
         return
-    await safe_edit(query, f"💳 Payment Settings\n\n🏦 UPI ID: {get_setting('upi_id') or 'customupi@bank'}\n\nTo change:\n/set_upi [new_upi_id]", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
+    upi = get_setting("upi_id") or "customupi@bank"
+    text = f"💳 Payment Settings\n\n🏦 UPI ID: {upi}\n\nTo change - Send: /set_upi NEW_UPI_ID"
+    keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]
+    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def show_admin_qr(query, context):
     if query.from_user.id not in ADMIN_IDS:
@@ -541,7 +544,8 @@ async def show_admin_qr(query, context):
     text = "📷 QR Code Settings\n\n"
     text += "✅ QR Code is set.\n" if qr else "❌ No QR Code set.\n"
     text += "\nTo set: Reply to a photo with /set_qr"
-    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
+    keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]
+    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def show_admin_howto(query, context):
     if query.from_user.id not in ADMIN_IDS:
@@ -550,7 +554,8 @@ async def show_admin_howto(query, context):
     text = "📖 How To Use Video\n\n"
     text += "✅ Video is set.\n" if vid else "❌ No video set.\n"
     text += "\nTo set: Reply to a video with /set_howto"
-    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
+    keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]
+    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def show_admin_orders(query, context, status):
     if query.from_user.id not in ADMIN_IDS:
@@ -563,7 +568,8 @@ async def show_admin_orders(query, context, status):
     else:
         for o in orders:
             text += f"• {o['first_name']} - {o['package_name']} - ₹{o['price']}\n  ID: {o['id']}\n\n"
-    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
+    keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]
+    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def show_blocked_users(query, context):
     if query.from_user.id not in ADMIN_IDS:
@@ -572,11 +578,13 @@ async def show_blocked_users(query, context):
     text = "🚫 Blocked Users:\n\n"
     if not blocked:
         text += "No blocked users."
-        await safe_edit(query, text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
+        keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]
+        await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
         return
     keyboard = []
     row = []
     for b in blocked:
+        text += f"• {b['first_name']} (@{b.get('username', 'N/A')}) - ID: {b['user_id']}\n"
         row.append(InlineKeyboardButton(f"🔓 {b['first_name']}", callback_data=f"unblock_{b['id']}"))
         if len(row) == 2:
             keyboard.append(row)
@@ -584,8 +592,6 @@ async def show_blocked_users(query, context):
     if row:
         keyboard.append(row)
     keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="admin_panel")])
-    for b in blocked:
-        text += f"• {b['first_name']} (@{b.get('username', 'N/A')}) - ID: {b['user_id']}\n"
     await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def show_users(query, context):
@@ -594,39 +600,40 @@ async def show_users(query, context):
     text = f"👥 Total Users: {count_users()}\n\nRecent Users:\n"
     for u in get_recent_users(10):
         text += f"• {u['first_name']} (@{u.get('username', 'N/A')})\n"
-    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
+    keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]
+    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def show_stats(query, context):
     if query.from_user.id not in ADMIN_IDS:
         return
     text = f"\n📊 Statistics\n\n📱 Number Packages: {count_products('number')}\n🎬 Video Packages: {count_products('video')}\n👥 Total Users: {count_users()}\n🚫 Blocked: {count_blocked()}\n\n📦 Orders: {count_orders()}\n⏳ Pending: {count_orders('pending')}\n✅ Approved: {count_orders('approved')}\n❌ Rejected: {count_orders('rejected')}\n"
-    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
+    keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]
+    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
 
-# ===================== ADMIN COMMANDS =====================
-
-async def add_number_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ===================== ADMIN TEXT COMMANDS (only 5 needed) =====================
+async def add_number_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         return
     try:
         args = context.args
         if len(args) < 3:
-            await update.message.reply_text("Usage: /add_number [name] [price] [quantity]\nExample: /add_number 5_Numbers 80 5")
+            await update.message.reply_text("Usage: /add_number Name Price Qty\nExample: /add_number 5_Numbers 80 5")
             return
         name = " ".join(args[:-2]).replace("_", " ")
         price = int(args[-2])
-        quantity = int(args[-1])
-        add_product("number", name, price, quantity)
-        await update.message.reply_text(f"✅ '{name}' added - ₹{price} ({quantity} numbers)")
+        qty = int(args[-1])
+        add_product("number", name, price, qty)
+        await update.message.reply_text(f"✅ '{name}' added - ₹{price} ({qty} numbers)")
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
 
-async def add_video_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def add_video_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         return
     try:
         args = context.args
         if len(args) < 3:
-            await update.message.reply_text("Usage: /add_video [name] [price] [link]\nExample: /add_video Fast 50 t.me/demo")
+            await update.message.reply_text("Usage: /add_video Name Price Link\nExample: /add_video Fast 50 t.me/link")
             return
         name = " ".join(args[:-2]).replace("_", " ")
         price = int(args[-2])
@@ -636,16 +643,18 @@ async def add_video_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
 
-async def delete_product_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def del_product_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         return
     try:
-        delete_product(int(context.args[0]))
-        await update.message.reply_text("✅ Package deleted.")
+        pid = int(context.args[0])
+        p = get_product(pid)
+        delete_product(pid)
+        await update.message.reply_text(f"✅ Product '{p['name'] if p else ''}' (ID: {pid}) deleted!")
     except:
         await update.message.reply_text("Usage: /del_product [id]")
 
-async def set_upi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def set_upi_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         return
     if not context.args:
@@ -654,7 +663,7 @@ async def set_upi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     update_setting("upi_id", " ".join(context.args))
     await update.message.reply_text(f"✅ UPI ID updated!")
 
-async def set_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def set_qr_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         return
     if update.message.reply_to_message and update.message.reply_to_message.photo:
@@ -663,7 +672,7 @@ async def set_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Reply to a photo with /set_qr")
 
-async def set_howto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def set_howto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         return
     if update.message.reply_to_message and update.message.reply_to_message.video:
@@ -671,23 +680,6 @@ async def set_howto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ How To Use video updated!")
     else:
         await update.message.reply_text("Reply to a video with /set_howto")
-
-async def set_position(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
-        return
-    if len(context.args) < 2:
-        await update.message.reply_text("Usage: /pos_number [vertical/horizontal] or /pos_video [vertical/horizontal]")
-        return
-    ptype, pos = context.args[0], context.args[1].lower()
-    if pos not in ["vertical", "horizontal"]:
-        await update.message.reply_text("Use 'vertical' or 'horizontal'.")
-        return
-    if ptype == "number":
-        update_setting("number_buttons_position", pos)
-        await update.message.reply_text(f"✅ Number buttons position: {pos}")
-    elif ptype == "video":
-        update_setting("video_buttons_position", pos)
-        await update.message.reply_text(f"✅ Video buttons position: {pos}")
 
 # ===================== HEALTH SERVER =====================
 class HealthHandler(BaseHTTPRequestHandler):
@@ -706,17 +698,19 @@ def run_health_server():
 def main():
     init_db()
     app = Application.builder().token(BOT_TOKEN).build()
+    
+    # শুধু প্রয়োজনীয় কমান্ড (বাকি সব বাটন-ভিত্তিক)
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("add_number", add_number_product))
-    app.add_handler(CommandHandler("add_video", add_video_product))
-    app.add_handler(CommandHandler("del_product", delete_product_cmd))
-    app.add_handler(CommandHandler("set_upi", set_upi))
-    app.add_handler(CommandHandler("set_qr", set_qr))
-    app.add_handler(CommandHandler("set_howto", set_howto))
-    app.add_handler(CommandHandler("pos_number", set_position))
-    app.add_handler(CommandHandler("pos_video", set_position))
+    app.add_handler(CommandHandler("add_number", add_number_cmd))
+    app.add_handler(CommandHandler("add_video", add_video_cmd))
+    app.add_handler(CommandHandler("del_product", del_product_cmd))
+    app.add_handler(CommandHandler("set_upi", set_upi_cmd))
+    app.add_handler(CommandHandler("set_qr", set_qr_cmd))
+    app.add_handler(CommandHandler("set_howto", set_howto_cmd))
+    
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.PHOTO, handle_screenshot))
+    
     logger.info("Bot started successfully!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
