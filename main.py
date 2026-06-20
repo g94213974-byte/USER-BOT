@@ -274,7 +274,6 @@ def count_blocked():
 
 # ===================== FIX: Safe edit_message helper =====================
 async def safe_edit(query, text, reply_markup=None):
-    """Edit message safely without triggering 'Message is not modified' error."""
     try:
         await query.edit_message_text(text, reply_markup=reply_markup)
     except Exception as e:
@@ -284,7 +283,6 @@ async def safe_edit(query, text, reply_markup=None):
             raise e
 
 async def safe_edit_caption(query, caption, reply_markup=None):
-    """Edit message caption safely."""
     try:
         await query.edit_message_caption(caption=caption, reply_markup=reply_markup)
     except Exception as e:
