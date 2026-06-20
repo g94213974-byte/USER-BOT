@@ -3,22 +3,17 @@ import datetime
 import logging
 import os
 import threading
-import re
+import random
 import asyncio
 import signal
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
-from telethon import TelegramClient, events
-from telethon.errors import RPCError
 
 # ===================== CONFIG =====================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(","))) if os.getenv("ADMIN_IDS") else []
 PORT = int(os.getenv("PORT", 10000))
-
-SESSION_DIR = "sessions"
-os.makedirs(SESSION_DIR, exist_ok=True)
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN environment variable is not set!")
@@ -30,7 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ===================== DATABASE =====================
+# ===================== DATABASE (Thread-Safe) =====================
 DB_FILE = "bot_data.db"
 _db_lock = threading.Lock()
 
@@ -44,42 +39,22 @@ def init_db():
     conn = get_db()
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, first_name TEXT, username TEXT, last_interaction TEXT, total_spent REAL DEFAULT 0)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, first_name TEXT, username TEXT, package_id TEXT, package_name TEXT, price REAL, quantity INTEGER DEFAULT 1, screenshot_file_id TEXT, status TEXT DEFAULT 'pending', created_at TEXT, delivered_at TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, price REAL, quantity INTEGER DEFAULT 1, position INTEGER)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, first_name TEXT, username TEXT, last_interaction TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, first_name TEXT, username TEXT, type TEXT, package_id TEXT, package_name TEXT, price REAL, quantity INTEGER DEFAULT 1, delivery_link TEXT DEFAULT '', screenshot_file_id TEXT, status TEXT DEFAULT 'pending', created_at TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT, name TEXT, price REAL, quantity INTEGER DEFAULT 1, delivery_link TEXT DEFAULT '', position INTEGER)''')
     c.execute('''CREATE TABLE IF NOT EXISTS blocked_users (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, first_name TEXT, username TEXT, blocked_at TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS number_pool (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, 
-        number TEXT UNIQUE, 
-        api_id INTEGER,
-        api_hash TEXT,
-        session_file TEXT,
-        status TEXT DEFAULT 'available',
-        sold_to INTEGER DEFAULT NULL,
-        sold_at TEXT DEFAULT NULL,
-        last_active DATETIME DEFAULT NULL,
-        login_valid INTEGER DEFAULT 1
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS active_logins (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        number_id INTEGER,
-        number TEXT,
-        api_id INTEGER,
-        api_hash TEXT,
-        session_file TEXT,
-        status TEXT DEFAULT 'awaiting_otp',
-        login_phase TEXT DEFAULT 'first_otp',
-        created_at TEXT
-    )''')
     
-    defaults = {"upi_id": "customupi@bank", "qr_code": ""}
+    defaults = {
+        "upi_id": "customupi@bank",
+        "qr_code": "",
+        "how_to_use_video": "",
+        "approval_message": "✅ **Payment Approved!**\n\n🎉 Thank you for your purchase, {first_name}!\n📦 Package: {package_name}\n💰 Amount: ₹{price}\n\nPlease use your product below.\n❤️ Thank you!"
+    }
     for k, v in defaults.items():
         c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, str(v)))
     conn.commit()
     conn.close()
 
-# ===================== DB FUNCTIONS =====================
 def get_setting(key):
     with _db_lock:
         conn = get_db()
@@ -124,31 +99,26 @@ def get_recent_users(limit=10):
         conn.close()
         return results
 
-def add_user_spent(user_id, amount):
+def add_product(type_name, name, price, extra):
     with _db_lock:
         conn = get_db()
         c = conn.cursor()
-        c.execute("UPDATE users SET total_spent = COALESCE(total_spent, 0) + ? WHERE user_id = ?", (amount, user_id))
-        conn.commit()
-        conn.close()
-
-# ===================== PRODUCTS =====================
-def add_product(name, price, quantity):
-    with _db_lock:
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM products", ())
+        c.execute("SELECT COUNT(*) FROM products WHERE type = ?", (type_name,))
         count = c.fetchone()[0]
-        c.execute("INSERT INTO products (name, price, quantity, position) VALUES (?, ?, ?, ?)", 
-                  (name, price, quantity, count + 1))
+        if type_name == "number":
+            c.execute("INSERT INTO products (type, name, price, quantity, position) VALUES (?, ?, ?, ?, ?)", 
+                      (type_name, name, price, int(extra), count + 1))
+        else:
+            c.execute("INSERT INTO products (type, name, price, delivery_link, position) VALUES (?, ?, ?, ?, ?)", 
+                      (type_name, name, price, extra, count + 1))
         conn.commit()
         conn.close()
 
-def get_products():
+def get_products(type_name):
     with _db_lock:
         conn = get_db()
         c = conn.cursor()
-        c.execute("SELECT * FROM products ORDER BY position")
+        c.execute("SELECT * FROM products WHERE type = ? ORDER BY position", (type_name,))
         results = [dict(row) for row in c.fetchall()]
         conn.close()
         return results
@@ -170,193 +140,21 @@ def delete_product(product_id):
         conn.commit()
         conn.close()
 
-def count_products():
+def count_products(type_name):
     with _db_lock:
         conn = get_db()
         c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM products")
+        c.execute("SELECT COUNT(*) FROM products WHERE type = ?", (type_name,))
         result = c.fetchone()[0]
         conn.close()
         return result
 
-# ===================== NUMBER POOL =====================
-def add_number_to_pool(number, api_id, api_hash, session_file):
+def create_order(user_id, first_name, username, p_type, package_id, package_name, price, quantity, delivery_link, screenshot_id):
     with _db_lock:
         conn = get_db()
         c = conn.cursor()
-        try:
-            c.execute(
-                "INSERT INTO number_pool (number, api_id, api_hash, session_file, status, login_valid) VALUES (?, ?, ?, ?, 'available', 1)", 
-                (number.strip(), api_id, api_hash, session_file)
-            )
-            conn.commit()
-            conn.close()
-            return True
-        except sqlite3.IntegrityError:
-            conn.close()
-            return False
-
-def get_available_numbers(limit=100):
-    with _db_lock:
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("SELECT * FROM number_pool WHERE status = 'available' AND login_valid = 1 LIMIT ?", (limit,))
-        results = [dict(row) for row in c.fetchall()]
-        conn.close()
-        return results
-
-def get_available_number_count():
-    with _db_lock:
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM number_pool WHERE status = 'available' AND login_valid = 1")
-        result = c.fetchone()[0]
-        conn.close()
-        return result
-
-def get_total_number_count():
-    with _db_lock:
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM number_pool")
-        result = c.fetchone()[0]
-        conn.close()
-        return result
-
-def get_sold_number_count():
-    with _db_lock:
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM number_pool WHERE status = 'sold'")
-        result = c.fetchone()[0]
-        conn.close()
-        return result
-
-def get_invalid_number_count():
-    with _db_lock:
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM number_pool WHERE login_valid = 0")
-        result = c.fetchone()[0]
-        conn.close()
-        return result
-
-def assign_number_for_login(user_id, number_ids, package_name, price):
-    """Assign numbers to user, setup for login verification, DON'T mark sold yet"""
-    with _db_lock:
-        conn = get_db()
-        c = conn.cursor()
-        now = datetime.datetime.now().isoformat()
-        assigned_numbers = []
-        
-        for num_id in number_ids:
-            c.execute("SELECT * FROM number_pool WHERE id = ? AND status = 'available' AND login_valid = 1", (num_id,))
-            row = c.fetchone()
-            if row:
-                session_file = f"login_{num_id}_{user_id}.session"
-                c.execute("UPDATE number_pool SET status = 'assigned', sold_to = ?, sold_at = ?, last_active = ? WHERE id = ?",
-                          (user_id, now, now, num_id))
-                assigned_numbers.append({
-                    'id': row['id'],
-                    'number': row['number'],
-                    'api_id': row['api_id'],
-                    'api_hash': row['api_hash'],
-                    'session_file': session_file
-                })
-                
-                c.execute("INSERT INTO active_logins (user_id, number_id, number, api_id, api_hash, session_file, status, login_phase, created_at) VALUES (?, ?, ?, ?, ?, ?, 'awaiting_otp', 'first_otp', ?)",
-                          (user_id, row['id'], row['number'], row['api_id'], row['api_hash'], session_file, now))
-        
-        conn.commit()
-        conn.close()
-        return assigned_numbers
-
-def get_active_login_for_user(user_id):
-    with _db_lock:
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("SELECT * FROM active_logins WHERE user_id = ? AND status = 'awaiting_otp' ORDER BY id DESC LIMIT 1", (user_id,))
-        row = c.fetchone()
-        conn.close()
-        return dict(row) if row else None
-
-def get_active_login_by_number(number):
-    with _db_lock:
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("SELECT * FROM active_logins WHERE number = ? AND status = 'awaiting_otp' ORDER BY id DESC LIMIT 1", (number,))
-        row = c.fetchone()
-        conn.close()
-        return dict(row) if row else None
-
-def update_active_login_phase(login_id, phase):
-    with _db_lock:
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("UPDATE active_logins SET login_phase = ? WHERE id = ?", (phase, login_id))
-        conn.commit()
-        conn.close()
-
-def complete_login_success(login_id, number_id):
-    """Mark number as SOLD after successful login"""
-    with _db_lock:
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("UPDATE active_logins SET status = 'success' WHERE id = ?", (login_id,))
-        c.execute("UPDATE number_pool SET status = 'sold' WHERE id = ?", (number_id,))
-        conn.commit()
-        conn.close()
-
-def complete_login_failed(login_id, number_id):
-    """Mark number back to AVAILABLE after failed login"""
-    with _db_lock:
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("UPDATE active_logins SET status = 'failed' WHERE id = ?", (login_id,))
-        c.execute("UPDATE number_pool SET status = 'available', sold_to = NULL, sold_at = NULL WHERE id = ?", (number_id,))
-        conn.commit()
-        conn.close()
-
-def mark_number_invalid(number_id):
-    with _db_lock:
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("UPDATE number_pool SET login_valid = 0 WHERE id = ?", (number_id,))
-        conn.commit()
-        conn.close()
-
-def mark_number_valid(number_id):
-    with _db_lock:
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("UPDATE number_pool SET login_valid = 1 WHERE id = ?", (number_id,))
-        conn.commit()
-        conn.close()
-
-def get_numbers_by_status(status, limit=30):
-    with _db_lock:
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("SELECT * FROM number_pool WHERE status = ? ORDER BY id DESC LIMIT ?", (status, limit))
-        results = [dict(row) for row in c.fetchall()]
-        conn.close()
-        return results
-
-def delete_number_stock(num_id):
-    with _db_lock:
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("DELETE FROM number_pool WHERE id = ?", (num_id,))
-        conn.commit()
-        conn.close()
-
-# ===================== ORDERS =====================
-def create_order(user_id, first_name, username, package_id, package_name, price, quantity, screenshot_id):
-    with _db_lock:
-        conn = get_db()
-        c = conn.cursor()
-        c.execute('''INSERT INTO orders (user_id, first_name, username, package_id, package_name, price, quantity, screenshot_file_id, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)''',
-                  (user_id, first_name, username, str(package_id), package_name, price, quantity, screenshot_id, datetime.datetime.now().isoformat()))
+        c.execute('''INSERT INTO orders (user_id, first_name, username, type, package_id, package_name, price, quantity, delivery_link, screenshot_file_id, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)''',
+                  (user_id, first_name, username, p_type, str(package_id), package_name, price, quantity, delivery_link, screenshot_id, datetime.datetime.now().isoformat()))
         order_id = c.lastrowid
         conn.commit()
         conn.close()
@@ -384,10 +182,7 @@ def update_order_status(order_id, status):
     with _db_lock:
         conn = get_db()
         c = conn.cursor()
-        if status == 'delivered':
-            c.execute("UPDATE orders SET status = ?, delivered_at = ? WHERE id = ?", (status, datetime.datetime.now().isoformat(), order_id))
-        else:
-            c.execute("UPDATE orders SET status = ? WHERE id = ?", (status, order_id))
+        c.execute("UPDATE orders SET status = ? WHERE id = ?", (status, order_id))
         conn.commit()
         conn.close()
 
@@ -412,16 +207,6 @@ def count_orders(status=None):
         conn.close()
         return result
 
-def get_total_revenue():
-    with _db_lock:
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("SELECT COALESCE(SUM(price), 0) FROM orders WHERE status = 'delivered'")
-        result = c.fetchone()[0]
-        conn.close()
-        return result
-
-# ===================== BLOCK =====================
 def block_user(user_id, first_name, username):
     with _db_lock:
         conn = get_db()
@@ -483,144 +268,89 @@ async def safe_edit_caption(query, caption, reply_markup=None):
         if "Message is not modified" not in str(e):
             logger.error(f"safe_edit_caption error: {e}")
 
-# ===================== TELETHON OTP MONITOR =====================
-async def start_otp_listener_and_wait(number_id, number, api_id, api_hash, session_file, timeout=120):
-    """
-    Start Telethon client, listen for OTP, wait and return:
-    - "OTP:CODE" if OTP received
-    - "TIMEOUT" if no OTP in time
-    - "LOGIN_FAILED" if login failure message detected
-    - "ERROR:msg" if error
-    """
-    session_path = os.path.join(SESSION_DIR, session_file)
-    otp_event = asyncio.Event()
-    otp_result = {"value": None}
-    
-    try:
-        client = TelegramClient(session_path, api_id, api_hash)
-        await client.connect()
-        
-        # Check if already authorized (shouldn't be)
-        if await client.is_user_authorized():
-            logger.warning(f"[{number}] Already authorized unexpectedly")
-            await client.disconnect()
-            return "ALREADY_AUTHORIZED"
-        
-        @client.on(events.NewMessage)
-        async def handler(event):
-            nonlocal otp_result
-            try:
-                text = event.raw_text
-                if not text:
-                    return
-                
-                logger.info(f"📩 [{number}] SMS: {text[:150]}")
-                
-                # Check for OTP codes
-                code_match = re.search(r'(\d{4,8})', text)
-                if code_match:
-                    otp_result["value"] = f"OTP:{code_match.group(1)}"
-                    otp_event.set()
-                    return
-                
-                # Check for login failure messages
-                fail_patterns = [
-                    r'incomplete login',
-                    r'failed login attempt',
-                    r'nobody gained access',
-                    r'incorrect password',
-                    r'password was not given',
-                    r'terminate the incomplete',
-                ]
-                for p in fail_patterns:
-                    if re.search(p, text, re.IGNORECASE):
-                        otp_result["value"] = "LOGIN_FAILED"
-                        otp_event.set()
-                        return
-                
-                # Also check for login success
-                success_patterns = [
-                    r'logged in',
-                    r'login successful',
-                    r'successfully logged',
-                ]
-                for p in success_patterns:
-                    if re.search(p, text, re.IGNORECASE):
-                        otp_result["value"] = "LOGIN_SUCCESS"
-                        otp_event.set()
-                        return
-                        
-            except Exception as e:
-                logger.error(f"[{number}] Handler error: {e}")
-        
-        # Wait for OTP
-        try:
-            await asyncio.wait_for(otp_event.wait(), timeout=timeout)
-        except asyncio.TimeoutError:
-            otp_result["value"] = "TIMEOUT"
-        
-        await client.disconnect()
-        return otp_result["value"]
-        
-    except Exception as e:
-        logger.error(f"[{number}] Listener error: {e}")
-        mark_number_invalid(number_id)
-        return f"ERROR:{str(e)[:50]}"
+# ===================== FORMAT APPROVAL MESSAGE =====================
+def format_approval_message(template, order):
+    """Replace placeholders in the approval message template with actual order data."""
+    replacements = {
+        "{first_name}": order.get("first_name", "User"),
+        "{username}": f"@{order.get('username', 'N/A')}" if order.get("username") else "N/A",
+        "{package_name}": order.get("package_name", "Package"),
+        "{package_id}": str(order.get("package_id", "")),
+        "{price}": str(order.get("price", "0")),
+        "{quantity}": str(order.get("quantity", "1")),
+        "{delivery_link}": order.get("delivery_link", ""),
+        "{order_id}": str(order.get("id", "")),
+        "{type}": "📱 Number" if order.get("type") == "number" else "🎬 Video",
+    }
+    for key, value in replacements.items():
+        template = template.replace(key, value)
+    return template
 
-# ===================== BOT HANDLERS =====================
+# ===================== USER HANDLERS =====================
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     save_user(user.id, user.first_name, user.username)
     if is_blocked(user.id):
-        await update.message.reply_text("⛔ আপনি ব্লক করা হয়েছেন।")
+        await update.message.reply_text("⛔ You have been blocked.")
         return
     
     keyboard = [
         [InlineKeyboardButton("📱 Buy Number", callback_data="buy_number")],
+        [InlineKeyboardButton("🎬 Buy Video", callback_data="buy_video")],
         [InlineKeyboardButton("📖 How To Use", callback_data="how_to_use")]
     ]
     if user.id in ADMIN_IDS:
         keyboard.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin_panel")])
     
-    await update.message.reply_text(
-        "👋 **স্বাগতম নম্বর বটে!**\n\n"
-        "📱 ভার্চুয়াল নম্বর কিনুন\n"
-        "✅ OTP রিসিভ করুন বটের মাধ্যমে\n"
-        "🔐 সম্পূর্ণ অটোমেটিক\n\n"
-        "নিচ থেকে সিলেক্ট করুন:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+    welcome_text = (
+        "👋 **Welcome to the Bot!**\n\n"
+        "📱 Buy virtual numbers\n"
+        "🎬 Buy premium videos\n"
+        "📖 Learn how to use\n\n"
+        "Select an option below:"
     )
+    await update.message.reply_text(welcome_text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
     if is_blocked(user_id):
-        await safe_edit(query, "⛔ আপনি ব্লক করা হয়েছেন।")
+        await safe_edit(query, "⛔ You have been blocked.")
         return
     data = query.data
     
+    # ===== USER SECTION =====
     if data == "how_to_use":
         await show_how_to_use(query, context)
     elif data == "buy_number":
-        await show_products(query, context)
-    elif data.startswith("pkg_"):
-        pkg_id = int(data.replace("pkg_", ""))
-        await show_payment(query, context, pkg_id)
+        await show_number_products(query, context)
+    elif data == "buy_video":
+        await show_video_products(query, context)
+    elif data.startswith("num_pkg_"):
+        await show_payment(query, context, "number", int(data.replace("num_pkg_", "")))
+    elif data.startswith("vid_pkg_"):
+        await show_payment(query, context, "video", int(data.replace("vid_pkg_", "")))
     elif data == "back_main":
         await back_to_main(query, context)
-    elif data == "back_products":
-        await show_products(query, context)
+    elif data == "back_numbers":
+        await show_number_products(query, context)
+    elif data == "back_videos":
+        await show_video_products(query, context)
     elif data == "cancel_payment":
         context.user_data["waiting_for_screenshot"] = False
         context.user_data["pending_pkg_id"] = None
-        await safe_edit(query, "❌ বাতিল করা হয়েছে।")
+        context.user_data["pending_type"] = None
+        await safe_edit(query, "❌ Payment cancelled.")
     elif data.startswith("pay_"):
-        pkg_id = int(data.replace("pay_", ""))
-        context.user_data["pending_pkg_id"] = pkg_id
+        parts = data.split("_")
+        context.user_data["pending_pkg_id"] = int(parts[2])
+        context.user_data["pending_type"] = parts[1]
         context.user_data["waiting_for_screenshot"] = True
-        await safe_edit(query, "📸 পেমেন্টের স্ক্রিনশট পাঠান।\n\n❌ Cancel:", 
+        await safe_edit(query, "📸 Please send your payment screenshot.\n\n❌ Press below to cancel:", 
                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_payment")]]))
+    # ===== ADMIN ORDERS =====
     elif data.startswith("approve_"):
         await approve_order(query, context, int(data.replace("approve_", "")))
     elif data.startswith("reject_"):
@@ -629,112 +359,112 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await block_user_from_order(query, context, int(data.replace("block_", "")))
     elif data.startswith("unblock_"):
         unblock_user(int(data.replace("unblock_", "")))
-        await safe_edit(query, "✅ আনব্লক করা হয়েছে!")
-    elif data == "start_login":
-        # User requests OTP - start listener
-        await handle_start_login(query, context)
-    elif data == "gate_otp":
-        # User clicked "Gate OTP" - needs new OTP
-        await handle_gate_otp(query, context)
-    elif data == "check_login":
-        # Check if login was successful
-        await handle_check_login(query, context)
+        await safe_edit(query, "✅ User has been unblocked.")
+    # ===== ADMIN SECTION =====
     elif data == "admin_panel":
-        if user_id in ADMIN_IDS:
-            await show_admin_panel(query, context)
+        await show_admin_panel(query, context)
     elif data.startswith("del_product_"):
-        if user_id in ADMIN_IDS:
-            pid = int(data.replace("del_product_", ""))
-            delete_product(pid)
-            await safe_edit(query, "✅ ডিলিট করা হয়েছে!")
-            await admin_products(query, context)
-    elif data == "admin_products":
-        if user_id in ADMIN_IDS:
-            await admin_products(query, context)
-    elif data == "admin_stock":
-        if user_id in ADMIN_IDS:
-            await admin_stock(query, context)
-    elif data == "admin_add_numbers":
-        if user_id in ADMIN_IDS:
-            context.user_data["waiting_for_numbers_bulk"] = True
-            await safe_edit(query, 
-                "✏️ **নম্বর যোগ করুন**\n\n"
-                "ফরম্যাট:\n"
-                "`ফোন:এপিআই_আইডি:এপিআই_হ্যাশ`\n\n"
-                "উদাহরণ:\n"
-                "`+8801234567890:123456:abcdef`\n\n"
-                "❌ /cancel")
-    elif data == "admin_sold":
-        if user_id in ADMIN_IDS:
-            await admin_sold(query, context)
+        if query.from_user.id in ADMIN_IDS:
+            product_id = int(data.replace("del_product_", ""))
+            product = get_product(product_id)
+            delete_product(product_id)
+            await safe_edit(query, f"✅ Product deleted!")
+            if product and product['type'] == 'number':
+                await admin_number_products(query, context)
+            elif product and product['type'] == 'video':
+                await admin_video_products(query, context)
+    elif data == "admin_numbers":
+        await admin_number_products(query, context)
+    elif data == "admin_videos":
+        await admin_video_products(query, context)
     elif data == "admin_payment":
-        if user_id in ADMIN_IDS:
-            await show_admin_payment(query, context)
+        await show_admin_payment(query, context)
     elif data == "admin_qr":
-        if user_id in ADMIN_IDS:
-            await show_admin_qr(query, context)
+        await show_admin_qr(query, context)
+    elif data == "admin_howto":
+        await show_admin_howto(query, context)
+    elif data == "admin_approval_msg":
+        await show_admin_approval_message(query, context)
     elif data == "admin_pending":
-        if user_id in ADMIN_IDS:
-            await show_admin_orders(query, context, "pending")
-    elif data == "admin_delivered":
-        if user_id in ADMIN_IDS:
-            await show_admin_orders(query, context, "delivered")
+        await show_admin_orders(query, context, "pending")
+    elif data == "admin_approved":
+        await show_admin_orders(query, context, "approved")
     elif data == "admin_rejected":
-        if user_id in ADMIN_IDS:
-            await show_admin_orders(query, context, "rejected")
+        await show_admin_orders(query, context, "rejected")
     elif data == "admin_blocked":
-        if user_id in ADMIN_IDS:
-            await show_blocked_users(query, context)
+        await show_blocked_users(query, context)
     elif data == "admin_users":
-        if user_id in ADMIN_IDS:
-            await show_users(query, context)
+        await show_users(query, context)
     elif data == "admin_stats":
-        if user_id in ADMIN_IDS:
-            await show_stats(query, context)
+        await show_stats(query, context)
+    # ===== ADMIN ACTIONS =====
+    elif data == "add_num_start":
+        if query.from_user.id in ADMIN_IDS:
+            context.user_data["waiting_for_num_name"] = True
+            await safe_edit(query, "✏️ Enter number package **name**:\n\nExample: `5 Random Numbers`\n\n⚠️ Use letters only, not numbers!\n\n❌ /cancel to cancel")
+    elif data == "add_vid_start":
+        if query.from_user.id in ADMIN_IDS:
+            context.user_data["waiting_for_vid_name"] = True
+            await safe_edit(query, "✏️ Enter video package **name**:\n\nExample: `Premium Video Pack`\n\n⚠️ Use letters only, not numbers!\n\n❌ /cancel to cancel")
     elif data == "edit_upi":
-        if user_id in ADMIN_IDS:
+        if query.from_user.id in ADMIN_IDS:
             context.user_data["waiting_for_upi"] = True
-            await safe_edit(query, "✏️ নতুন UPI ID পাঠান:\nউদাহরণ: `yourupi@paytm`\n\n❌ /cancel")
+            await safe_edit(query, "✏️ Send your new UPI ID:\n\nExample: `yourupi@paytm`\n\n❌ /cancel to cancel")
     elif data == "edit_qr":
-        if user_id in ADMIN_IDS:
+        if query.from_user.id in ADMIN_IDS:
             context.user_data["waiting_for_qr"] = True
-            await safe_edit(query, "📷 QR ইমেজ পাঠান:\n\n❌ /cancel")
-    elif data == "add_product":
-        if user_id in ADMIN_IDS:
-            context.user_data["waiting_for_product_name"] = True
-            await safe_edit(query, "✏️ প্যাকেজের নাম:\nউদাহরণ: `5 Numbers`\n\n❌ /cancel")
+            await safe_edit(query, "📷 Send the QR code photo.\n\n❌ /cancel to cancel")
+    elif data == "edit_howto":
+        if query.from_user.id in ADMIN_IDS:
+            context.user_data["waiting_for_howto"] = True
+            await safe_edit(query, "🎬 Send the How-To-Use video.\n\n❌ /cancel to cancel")
+    elif data == "edit_approval_msg":
+        if query.from_user.id in ADMIN_IDS:
+            context.user_data["waiting_for_approval_msg"] = True
+            await safe_edit(query, 
+                "✏️ Send your custom approval message.\n\n"
+                "**Available placeholders:**\n"
+                "`{first_name}` — User's first name\n"
+                "`{username}` — @username\n"
+                "`{package_name}` — Product name\n"
+                "`{price}` — Price paid\n"
+                "`{quantity}` — Quantity\n"
+                "`{delivery_link}` — Delivery link (for videos)\n"
+                "`{type}` — 📱 or 🎬 emoji\n"
+                "`{order_id}` — Order ID number\n\n"
+                "Example:\n"
+                "```\n✅ Payment Approved!\n\n"
+                "Hi {first_name}!\n"
+                "Package: {package_name}\n"
+                "Price: ₹{price}\n\n"
+                "Enjoy! 🎉\n```\n\n"
+                "❌ /cancel to cancel",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_approval_msg")]])
+            )
 
 async def show_how_to_use(query, context):
-    await safe_edit(query, 
-        "📖 **কিভাবে কাজ করে**\n\n"
-        "🔹 নম্বর কিনুন\n"
-        "🔹 **Start Login** বাটনে ক্লিক করুন\n"
-        "🔹 আপনার নম্বরে Telegram থেকে **OTP পাঠাবে**\n"
-        "🔹 বট সেই OTP **ডিটেক্ট করে আপনাকে দেবে**\n"
-        "🔹 আপনি OTP বসিয়ে লগইন করুন\n"
-        "🔹 লগইন সম্পন্ন হলে **নম্বরটি আপনার হয়ে যাবে**\n\n"
-        "⚠️ **নোট:**\n"
-        "• OTP না পেলে **Gate OTP** বাটনে ক্লিক করুন\n"
-        "• ২ মিনিটের মধ্যে OTP দিন\n"
-        "• সফল লগইনের পর নম্বর **আপনার**, আর কাউকে দেওয়া হবে না",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_main")]])
-    )
+    video_id = get_setting("how_to_use_video")
+    if video_id:
+        try:
+            await context.bot.send_video(chat_id=query.message.chat_id, video=video_id, 
+                                         caption="📖 Watch this video to learn how to use the bot.")
+        except Exception as e:
+            logger.error(f"Error sending how-to video: {e}")
+    await safe_edit(query, "📖 How To Use\n\nWatch the video above to learn how to use the bot.", 
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_main")]]))
 
-async def show_products(query, context):
-    products = get_products()
-    available = get_available_number_count()
-    
-    text = f"📱 **নম্বর প্যাকেজ**\n\n🟢 স্টকে: {available} টি\n\n"
-    
+async def show_number_products(query, context):
+    products = get_products("number")
     if not products:
-        text += "❌ কোনো প্যাকেজ নেই।"
-        await safe_edit(query, text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_main")]]))
+        await safe_edit(query, "❌ No number packages available yet.", 
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_main")]]))
         return
-    
+    text = "📱 **Number Packages**\n\nSelect a package below:"
     keyboard = []
     row = []
     for p in products:
-        row.append(InlineKeyboardButton(f"{p['name']} - ₹{p['price']}", callback_data=f"pkg_{p['id']}"))
+        btn = InlineKeyboardButton(f"{p['name']} - ₹{p['price']}", callback_data=f"num_pkg_{p['id']}")
+        row.append(btn)
         if len(row) == 2:
             keyboard.append(row)
             row = []
@@ -743,899 +473,624 @@ async def show_products(query, context):
     keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_main")])
     await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
 
-async def show_payment(query, context, pkg_id):
+async def show_video_products(query, context):
+    products = get_products("video")
+    if not products:
+        await safe_edit(query, "❌ No video packages available yet.", 
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_main")]]))
+        return
+    text = "🎬 **Video Packages**\n\nSelect a package below:"
+    keyboard = []
+    row = []
+    for p in products:
+        btn = InlineKeyboardButton(f"{p['name']} - ₹{p['price']}", callback_data=f"vid_pkg_{p['id']}")
+        row.append(btn)
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_main")])
+    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def show_payment(query, context, p_type, pkg_id):
+    """Payment page with buttons that actually work"""
     product = get_product(pkg_id)
     if not product:
-        await safe_edit(query, "❌ প্যাকেজ পাওয়া যায়নি।")
+        await safe_edit(query, "❌ Package not found.")
         return
-    
-    available = get_available_number_count()
-    if available < product['quantity']:
-        await safe_edit(query, f"❌ **স্টক শেষ!**\nপ্রয়োজন: {product['quantity']} টি\nস্টকে: {available} টি")
-        return
-    
     upi_id = get_setting("upi_id") or "customupi@bank"
     qr_code = get_setting("qr_code")
     
     payment_text = (
-        f"💳 **পেমেন্ট**\n\n"
-        f"📦 {product['name']}\n"
-        f"💰 ₹{product['price']}\n"
-        f"📦 {product['quantity']} টি নম্বর\n"
-        f"🏦 UPI: `{upi_id}`\n\n"
-        f"পেমেন্ট করে নিচের বাটনে ক্লিক করুন:"
+        f"💳 **Payment Details**\n\n"
+        f"📦 Package: {product['name']}\n"
+        f"💰 Amount: ₹{product['price']}\n"
+        f"🏦 UPI ID: `{upi_id}`\n\n"
+        f"📱 Pay using PhonePe / GPay / Paytm\n\n"
+        f"⚠️ Pay the EXACT amount shown above"
     )
     
     keyboard = [
-        [InlineKeyboardButton("📸 I Have Paid", callback_data=f"pay_{pkg_id}")],
-        [InlineKeyboardButton("🔙 Back", callback_data="back_products")]
+        [InlineKeyboardButton("📸 I Have Paid", callback_data=f"pay_{p_type}_{pkg_id}")],
+        [InlineKeyboardButton("🔙 Back", callback_data=f"back_{p_type}s")]
     ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
     
     if qr_code:
         try:
-            try: await query.message.delete()
-            except: pass
-            await context.bot.send_photo(chat_id=query.message.chat_id, photo=qr_code, caption=payment_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+            try:
+                await query.message.delete()
+            except:
+                pass
+            await context.bot.send_photo(
+                chat_id=query.message.chat_id, 
+                photo=qr_code, 
+                caption=payment_text, 
+                reply_markup=reply_markup, 
+                parse_mode='Markdown'
+            )
             return
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"Error sending QR: {e}")
     
-    try: await query.message.delete()
-    except: pass
-    await context.bot.send_message(chat_id=query.message.chat_id, text=payment_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    try:
+        await query.message.delete()
+    except:
+        pass
+    await context.bot.send_message(
+        chat_id=query.message.chat_id,
+        text=payment_text,
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
 
-# ===================== MESSAGE HANDLER =====================
+# ===================== MESSAGE HANDLER =====
 async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles ALL user inputs: text, photos, videos"""
     user = update.effective_user
     
-    if update.message.text and update.message.text.strip() == "/cancel":
-        for key in list(context.user_data.keys()):
-            if key.startswith("waiting_for_"):
-                context.user_data[key] = False
-        await update.message.reply_text("❌ বাতিল করা হয়েছে।")
+    # ===== CANCEL =====
+    if update.message.text == "/cancel":
+        for key in ["waiting_for_upi", "waiting_for_qr", "waiting_for_howto", 
+                     "waiting_for_screenshot", "waiting_for_num_name", "waiting_for_num_price",
+                     "waiting_for_num_qty", "waiting_for_vid_name", "waiting_for_vid_price",
+                     "waiting_for_vid_link", "waiting_for_approval_msg"]:
+            context.user_data[key] = False
+        await update.message.reply_text("❌ Cancelled.")
         return
     
-    # ADMIN: ADD BULK NUMBERS
-    if context.user_data.get("waiting_for_numbers_bulk") and user.id in ADMIN_IDS:
-        text = update.message.text.strip()
-        lines = text.strip().split('\n')
-        added = 0
-        failed = 0
-        
-        for line in lines:
-            line = line.strip()
-            if not line: continue
-            parts = line.split(':')
-            if len(parts) >= 3:
-                phone = parts[0].strip()
-                try:
-                    api_id = int(parts[1].strip())
-                    api_hash = parts[2].strip()
-                    session_file = f"session_{phone.replace('+', '')}.session"
-                    if add_number_to_pool(phone, api_id, api_hash, session_file):
-                        added += 1
-                    else:
-                        failed += 1
-                except ValueError:
-                    failed += 1
-            else:
-                failed += 1
-        
-        context.user_data["waiting_for_numbers_bulk"] = False
-        await update.message.reply_text(
-            f"✅ **নম্বর যোগ!**\n"
-            f"➕ {added}\n❌ {failed}\n"
-            f"📊 মোট: {get_total_number_count()}\n🟢 উপলব্ধ: {get_available_number_count()}"
-        )
+    # ===== ADMIN: CUSTOM APPROVAL MESSAGE =====
+    if context.user_data.get("waiting_for_approval_msg") and user.id in ADMIN_IDS:
+        msg = update.message.text.strip()
+        if len(msg) < 10:
+            await update.message.reply_text("❌ Message too short! Please write at least 10 characters.\n\n❌ /cancel to cancel")
+            return
+        update_setting("approval_message", msg)
+        context.user_data["waiting_for_approval_msg"] = False
+        await update.message.reply_text(f"✅ **Approval message updated!**\n\nHere's a preview with placeholders:\n\n{format_approval_message(msg, {'first_name': user.first_name, 'username': user.username, 'package_name': 'Test Package', 'package_id': '1', 'price': '100', 'quantity': '1', 'delivery_link': 'https://t.me/test', 'id': '1', 'type': 'number'})}")
         return
     
-    # ADMIN: ADD PRODUCT
-    if context.user_data.get("waiting_for_product_name") and user.id in ADMIN_IDS:
+    # ===== ADMIN: ADD NUMBER PACKAGE =====
+    if context.user_data.get("waiting_for_num_name") and user.id in ADMIN_IDS:
         name = update.message.text.strip()
         if name.isdigit():
-            await update.message.reply_text("❌ নাম লিখুন। উদাহরণ: `5 Numbers`\n\n❌ /cancel")
+            await update.message.reply_text("❌ Please enter a **name** with letters, not just numbers!\n\nExample: `5 Random Numbers`\n\n❌ /cancel to cancel")
             return
-        context.user_data["new_product_name"] = name
-        context.user_data["waiting_for_product_name"] = False
-        context.user_data["waiting_for_product_price"] = True
-        await update.message.reply_text("✏️ দাম (₹):\nউদাহরণ: `50`\n\n❌ /cancel")
+        context.user_data["new_num_name"] = name
+        context.user_data["waiting_for_num_name"] = False
+        context.user_data["waiting_for_num_price"] = True
+        await update.message.reply_text("✏️ Enter price (in ₹):\n\nExample: `50`\n\n❌ /cancel to cancel")
         return
     
-    if context.user_data.get("waiting_for_product_price") and user.id in ADMIN_IDS:
+    if context.user_data.get("waiting_for_num_price") and user.id in ADMIN_IDS:
         try:
-            price = float(update.message.text.strip())
+            price = int(update.message.text.strip())
             if price <= 0:
-                await update.message.reply_text("❌ দাম ০ এর বেশি হতে হবে!\n\n❌ /cancel")
+                await update.message.reply_text("❌ Price must be greater than 0!\n\n❌ /cancel to cancel")
                 return
-            context.user_data["new_product_price"] = price
-            context.user_data["waiting_for_product_price"] = False
-            context.user_data["waiting_for_product_qty"] = True
-            await update.message.reply_text("✏️ কয়টি নম্বর:\nউদাহরণ: `5`\n\n❌ /cancel")
+            context.user_data["new_num_price"] = price
+            context.user_data["waiting_for_num_price"] = False
+            context.user_data["waiting_for_num_qty"] = True
+            await update.message.reply_text("✏️ Enter quantity (how many numbers?):\n\nExample: `5`\n\n❌ /cancel to cancel")
         except ValueError:
-            await update.message.reply_text("❌ দাম একটি সংখ্যা হতে হবে।\n\n❌ /cancel")
+            await update.message.reply_text("❌ Invalid price! Send a number like `50`.\n\n❌ /cancel to cancel")
         return
     
-    if context.user_data.get("waiting_for_product_qty") and user.id in ADMIN_IDS:
+    if context.user_data.get("waiting_for_num_qty") and user.id in ADMIN_IDS:
         try:
             qty = int(update.message.text.strip())
             if qty <= 0:
-                await update.message.reply_text("❌ সংখ্যা ০ এর বেশি হতে হবে!\n\n❌ /cancel")
+                await update.message.reply_text("❌ Quantity must be greater than 0!\n\n❌ /cancel to cancel")
                 return
-            name = context.user_data.get("new_product_name", "Package")
-            price = context.user_data.get("new_product_price", 0)
-            add_product(name, price, qty)
-            context.user_data["waiting_for_product_qty"] = False
-            await update.message.reply_text(f"✅ **প্যাকেজ যোগ!**\n📱 {name}\n💰 ₹{price}\n📦 {qty} টি")
+            name = context.user_data.get("new_num_name", "Package")
+            price = context.user_data.get("new_num_price", 0)
+            add_product("number", name, price, qty)
+            context.user_data["waiting_for_num_qty"] = False
+            await update.message.reply_text(f"✅ **Number package added!**\n\n📱 {name}\n💰 ₹{price}\n📦 Qty: {qty}")
         except ValueError:
-            await update.message.reply_text("❌ সংখ্যা ইনপুট সঠিক নয়।\n\n❌ /cancel")
+            await update.message.reply_text("❌ Invalid quantity! Send a number like `5`.\n\n❌ /cancel to cancel")
         return
     
-    # ADMIN: SETTINGS
+    # ===== ADMIN: ADD VIDEO PACKAGE =====
+    if context.user_data.get("waiting_for_vid_name") and user.id in ADMIN_IDS:
+        name = update.message.text.strip()
+        if name.isdigit():
+            await update.message.reply_text("❌ Please enter a **name** with letters, not just numbers!\n\nExample: `Premium Video Pack`\n\n❌ /cancel to cancel")
+            return
+        context.user_data["new_vid_name"] = name
+        context.user_data["waiting_for_vid_name"] = False
+        context.user_data["waiting_for_vid_price"] = True
+        await update.message.reply_text("✏️ Enter price (in ₹):\n\nExample: `100`\n\n❌ /cancel to cancel")
+        return
+    
+    if context.user_data.get("waiting_for_vid_price") and user.id in ADMIN_IDS:
+        try:
+            price = int(update.message.text.strip())
+            if price <= 0:
+                await update.message.reply_text("❌ Price must be greater than 0!\n\n❌ /cancel to cancel")
+                return
+            context.user_data["new_vid_price"] = price
+            context.user_data["waiting_for_vid_price"] = False
+            context.user_data["waiting_for_vid_link"] = True
+            await update.message.reply_text("✏️ Enter delivery link:\n\nExample: `https://t.me/yourchannel/123`\n\n❌ /cancel to cancel")
+        except ValueError:
+            await update.message.reply_text("❌ Invalid price! Send a number like `100`.\n\n❌ /cancel to cancel")
+        return
+    
+    if context.user_data.get("waiting_for_vid_link") and user.id in ADMIN_IDS:
+        link = update.message.text.strip()
+        if not link.startswith("http") and not link.startswith("t.me") and not link.startswith("https://t.me"):
+            await update.message.reply_text("❌ Please enter a valid link starting with `https://` or `t.me/`\n\n❌ /cancel to cancel")
+            return
+        name = context.user_data.get("new_vid_name", "Video Pack")
+        price = context.user_data.get("new_vid_price", 0)
+        add_product("video", name, price, link)
+        context.user_data["waiting_for_vid_link"] = False
+        await update.message.reply_text(f"✅ **Video package added!**\n\n🎬 {name}\n💰 ₹{price}\n🔗 {link}")
+        return
+    
+    # ===== ADMIN: SET UPI ID =====
     if context.user_data.get("waiting_for_upi") and user.id in ADMIN_IDS:
         new_upi = update.message.text.strip()
         if "@" not in new_upi:
-            await update.message.reply_text("❌ UPI ID তে '@' থাকতে হবে।\n`upi@paytm`\n\n❌ /cancel")
+            await update.message.reply_text("❌ Invalid UPI ID. Must contain '@'.\n\nExample: `yourupi@paytm`\n\n❌ /cancel to cancel")
             return
         update_setting("upi_id", new_upi)
         context.user_data["waiting_for_upi"] = False
-        await update.message.reply_text(f"✅ **UPI আপডেট!**\n`{new_upi}`")
+        await update.message.reply_text(f"✅ **UPI ID updated!**\n\nNew ID: `{new_upi}`")
         return
     
+    # ===== ADMIN: SET QR CODE =====
     if context.user_data.get("waiting_for_qr") and user.id in ADMIN_IDS:
         if update.message.photo:
             update_setting("qr_code", update.message.photo[-1].file_id)
             context.user_data["waiting_for_qr"] = False
-            await update.message.reply_text("✅ **QR আপডেট!**")
+            await update.message.reply_text("✅ **QR Code updated!**")
         else:
-            await update.message.reply_text("❌ ছবি পাঠান।\n\n❌ /cancel")
+            await update.message.reply_text("❌ Please send a **photo** (image), not a file.\n\n❌ /cancel to cancel")
         return
     
-    # USER: PAYMENT SCREENSHOT
+    # ===== ADMIN: SET HOW TO VIDEO =====
+    if context.user_data.get("waiting_for_howto") and user.id in ADMIN_IDS:
+        if update.message.video:
+            update_setting("how_to_use_video", update.message.video.file_id)
+            context.user_data["waiting_for_howto"] = False
+            await update.message.reply_text("✅ **How-To video updated!**")
+        else:
+            await update.message.reply_text("❌ Please send a **video** file.\n\n❌ /cancel to cancel")
+        return
+    
+    # ===== USER: PAYMENT SCREENSHOT =====
     if context.user_data.get("waiting_for_screenshot"):
         if not update.message.photo:
-            await update.message.reply_text("📸 পেমেন্টের স্ক্রিনশট পাঠান (ছবি)।")
+            await update.message.reply_text("📸 Please send a **screenshot image** (photo).")
             return
-        
         pending = get_pending_order_by_user(user.id)
         if pending:
-            await update.message.reply_text("⏳ আপনার ইতিমধ্যে পেন্ডিং অর্ডার আছে।")
+            await update.message.reply_text("⏳ Your payment is already under review.\n\nPlease wait for verification.")
             return
-        
         photo = update.message.photo[-1]
         pkg_id = context.user_data.get("pending_pkg_id")
+        p_type = context.user_data.get("pending_type", "number")
         product = get_product(pkg_id) if pkg_id else None
-        
         if not product:
-            await update.message.reply_text("❌ প্যাকেজ পাওয়া যায়নি। /start")
+            await update.message.reply_text("❌ Package not found. Please start again with /start")
             return
-        
-        order_id = create_order(
-            user.id, user.first_name, user.username, 
-            pkg_id, product['name'], 
-            product['price'], product.get('quantity', 1), 
-            photo.file_id
-        )
-        
+        order_id = create_order(user.id, user.first_name, user.username, p_type, pkg_id, product['name'], 
+                                product['price'], product.get('quantity', 1), product.get('delivery_link', ''), photo.file_id)
         context.user_data["waiting_for_screenshot"] = False
         context.user_data["pending_pkg_id"] = None
-        
-        await update.message.reply_text(
-            "✅ **পেমেন্ট রিসিভ!**\n\n⏳ **৫-৩০ মিনিট** অপেক্ষা করুন।\nঅ্যাডমিন ভেরিফাই করে নম্বর দেবেন।"
-        )
-        
-        await notify_admins(context, user, product, photo.file_id, order_id)
+        context.user_data["pending_type"] = None
+        await update.message.reply_text("✅ **Payment screenshot received!**\n\n⏳ Please wait 5–30 minutes while we verify your payment.")
+        await notify_admins(context, user, product, photo.file_id, p_type, order_id)
         return
 
-async def notify_admins(context, user, product, screenshot_id, order_id):
+async def notify_admins(context, user, product, screenshot_id, p_type, order_id):
+    pkg_emoji = "📱" if p_type == "number" else "🎬"
     text = (
-        f"\n📱 **নতুন অর্ডার!**\n\n"
-        f"👤 {user.first_name}\n"
-        f"🆔 `{user.id}`\n"
-        f"📛 @{user.username or 'N/A'}\n"
-        f"📦 {product['name']}\n"
-        f"💰 ₹{product['price']}\n"
-        f"📦 {product.get('quantity', 1)} টি"
+        f"\n{pkg_emoji} **New Order Received!**\n\n"
+        f"👤 Name: {user.first_name}\n"
+        f"🆔 User ID: {user.id}\n"
+        f"📛 Username: @{user.username if user.username else 'N/A'}\n\n"
+        f"📦 Package: {product['name']}\n"
+        f"💰 Price: ₹{product['price']}\n"
     )
-    
     keyboard = [
         [InlineKeyboardButton("✅ APPROVE", callback_data=f"approve_{order_id}"), 
          InlineKeyboardButton("❌ REJECT", callback_data=f"reject_{order_id}")],
         [InlineKeyboardButton("🚫 BLOCK", callback_data=f"block_{order_id}")]
     ]
-    
     for admin_id in ADMIN_IDS:
         try:
-            await context.bot.send_photo(
-                chat_id=admin_id, 
-                photo=screenshot_id, 
-                caption=text, 
-                reply_markup=InlineKeyboardMarkup(keyboard), 
-                parse_mode='Markdown'
-            )
+            await context.bot.send_photo(chat_id=admin_id, photo=screenshot_id, caption=text, 
+                                         reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
         except Exception as e:
-            logger.error(f"Admin notify: {e}")
+            logger.error(f"Could not notify admin {admin_id}: {e}")
 
 async def approve_order(query, context, order_id):
+    """FIXED: Uses customizable approval message instead of random numbers."""
     order = get_order(order_id)
     if not order:
-        await safe_edit(query, "❌ অর্ডার পাওয়া যায়নি।")
+        await safe_edit(query, "❌ Order not found.")
         return
     
+    update_order_status(order_id, "approved")
     user_id = order["user_id"]
-    qty = order.get("quantity", 1)
     
-    available = get_available_numbers(qty)
-    if len(available) < qty:
-        await safe_edit_caption(query, caption=f"⚠️ স্টক শেষ! প্রয়োজন {qty}, আছে {len(available)}")
+    # Get the customizable approval message from settings
+    approval_template = get_setting("approval_message") or "✅ **Payment Approved!**\n\n🎉 Thank you for your purchase, {first_name}!\n📦 Package: {package_name}\n💰 Amount: ₹{price}\n\n❤️ Thank you!"
+    
+    # Format the message with actual order data
+    approval_text = format_approval_message(approval_template, order)
+    
+    # If it's a video order and has a delivery link, append it
+    if order["type"] == "video" and order.get("delivery_link"):
+        # Check if the template already has {delivery_link} placeholder used
+        if "{delivery_link}" not in approval_template:
+            approval_text += f"\n\n🔗 **Access Link:**\n{order['delivery_link']}"
+    
+    try:
+        await context.bot.send_message(chat_id=user_id, text=approval_text, parse_mode='Markdown')
+    except Exception as e:
+        logger.error(f"Could not send approval to user {user_id}: {e}")
+        # Fallback without markdown if parsing fails
         try:
-            await context.bot.send_message(chat_id=user_id, text="❌ পর্যাপ্ত নম্বর নেই। পরে আসবেন।")
-        except:
-            pass
-        return
+            await context.bot.send_message(chat_id=user_id, text=approval_text)
+        except Exception as e2:
+            logger.error(f"Could not send fallback to user {user_id}: {e2}")
     
-    # Assign numbers for login (NOT sold yet!)
-    num_ids = [n['id'] for n in available[:qty]]
-    assigned = assign_number_for_login(user_id, num_ids, order['package_name'], order['price'])
-    
-    if not assigned:
-        await safe_edit_caption(query, caption="❌ অ্যাসাইন ব্যর্থ।")
-        return
-    
-    update_order_status(order_id, "delivered")
-    add_user_spent(user_id, order['price'])
-    
-    # Send number to user with Start Login button
-    text = "✅ **অর্ডার অ্যাপ্রুভড!** ✅\n\n"
-    text += "📋 **আপনার নম্বর:**\n\n"
-    
-    for i, num in enumerate(assigned, 1):
-        text += f"━━━━━━━━━━━━━\n📱 নম্বর {i}: `{num['number']}`\n"
-    
-    text += (
-        "━━━━━━━━━━━━━\n\n"
-        "🔰 **এখন লগইন করতে নিচের বাটনে ক্লিক করুন**\n\n"
-        "📌 ১. Telegram অ্যাপ খুলুন\n"
-        "📌 ২. এই নম্বর দিয়ে লগইন করুন\n"
-        "📌 ৩. Telegram OTP পাঠাবে - বট সেটা ডিটেক্ট করবে\n"
-        "📌 ৪. বট থেকে OTP নিয়ে বসান\n"
-        "📌 ৫. লগইন সম্পন্ন করুন!\n\n"
-        "👇 **Start Login** বাটনে ক্লিক করুন"
-    )
-    
-    keyboard = [[InlineKeyboardButton("📲 Start Login", callback_data="start_login")]]
-    
-    try:
-        await context.bot.send_message(chat_id=user_id, text=text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
-    except Exception as e:
-        logger.error(f"Send to user failed: {e}")
-    
-    num_list = ", ".join([f"`{n['number']}`" for n in assigned])
-    await safe_edit_caption(query, caption=f"✅ **অ্যাপ্রুভড!**\n{order['package_name']}\n👤 {order['first_name']}\n📱 {num_list}")
-
-async def handle_start_login(query, context):
-    """Start listening for OTP"""
-    user_id = query.from_user.id
-    active = get_active_login_for_user(user_id)
-    
-    if not active:
-        await safe_edit(query, 
-            "❌ **কোনো সক্রিয় লগইন নেই!**\n\nআপনি এখনো নম্বর কেনেননি। /start",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_main")]])
-        )
-        return
-    
-    number = active['number']
-    number_id = active['number_id']
-    
-    await safe_edit(query, 
-        "⏳ **OTP এর জন্য অপেক্ষা করুন...**\n\n"
-        f"📱 নম্বর: `{number}`\n\n"
-        "🔴 **Telegram অ্যাপে গিয়ে লগইন করুন**\n"
-        "Telegram আপনার নম্বরে **OTP পাঠাবে**\n"
-        "বট সেটা ডিটেক্ট করে আপনাকে জানাবে।\n\n"
-        "⏱️ সর্বোচ্চ **২ মিনিট** সময়",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Check Status", callback_data="check_login")]])
-    )
-    
-    # Run OTP listener in background
-    asyncio.create_task(
-        run_otp_listener(context, active['id'], user_id, number_id, number, 
-                        active['api_id'], active['api_hash'], active['session_file'],
-                        query.message.chat_id, query.message.message_id, 'first_otp')
-    )
-
-async def handle_gate_otp(query, context):
-    """User clicked Gate OTP - they need a new OTP code"""
-    user_id = query.from_user.id
-    active = get_active_login_for_user(user_id)
-    
-    if not active:
-        await safe_edit(query, 
-            "❌ **কোনো সক্রিয় লগইন নেই!**",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_main")]])
-        )
-        return
-    
-    # Update phase
-    update_active_login_phase(active['id'], 'gate_otp')
-    
-    number = active['number']
-    
-    await safe_edit(query, 
-        "🔑 **নতুন OTP এর জন্য অপেক্ষা করুন...**\n\n"
-        f"📱 নম্বর: `{number}`\n\n"
-        "Telegram অ্যাপে **পুনরায় OTP রিকোয়েস্ট করুন**\n"
-        "(Gate OTP বাটনে ক্লিক করুন)\n\n"
-        "বট নতুন OTP ডিটেক্ট করবে...\n\n"
-        "⏱️ সর্বোচ্চ **২ মিনিট**",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Check Status", callback_data="check_login")]])
-    )
-    
-    # Run OTP listener again
-    asyncio.create_task(
-        run_otp_listener(context, active['id'], user_id, active['number_id'], number,
-                        active['api_id'], active['api_hash'], active['session_file'],
-                        query.message.chat_id, query.message.message_id, 'gate_otp')
-    )
-
-async def run_otp_listener(context, login_id, user_id, number_id, number, api_id, api_hash, session_file, chat_id, message_id, phase):
-    """Background task to listen for OTP"""
-    try:
-        result = await start_otp_listener_and_wait(number_id, number, api_id, api_hash, session_file, timeout=120)
-        
-        if result and result.startswith("OTP:"):
-            otp_code = result.replace("OTP:", "")
-            logger.info(f"✅ [{number}] OTP received: {otp_code}")
-            
-            update_active_login_phase(login_id, f"{phase}_done")
-            
-            # Send OTP to user with Gate OTP option
-            text = (
-                f"✅ **OTP রিসিভ!** ✅\n\n"
-                f"📱 নম্বর: `{number}`\n"
-                f"🔑 **OTP কোড: `{otp_code}`**\n\n"
-                f"⚡ **এখনই ব্যবহার করুন!**\n\n"
-                f"Telegram অ্যাপে এই OTP বসান।\n\n"
-                f"⚠️ OTP **২ মিনিট** এর মধ্যে এক্সপায়ার হবে!\n\n"
-                f"✅ লগইন সম্পন্ন হলে নিচের বাটনে ক্লিক করুন\n"
-                f"অথবা নতুন OTP চাইলে Gate OTP ক্লিক করুন"
-            )
-            
-            keyboard = [
-                [InlineKeyboardButton("✅ Login Done - Check", callback_data="check_login")],
-                [InlineKeyboardButton("🔄 Gate OTP (New Code)", callback_data="gate_otp")]
-            ]
-            
-            try:
-                await context.bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    text=text,
-                    parse_mode='Markdown',
-                    reply_markup=InlineKeyboardMarkup(keyboard)
-                )
-            except:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=text,
-                    parse_mode='Markdown',
-                    reply_markup=InlineKeyboardMarkup(keyboard)
-                )
-        
-        elif result == "LOGIN_FAILED":
-            logger.info(f"⚠️ [{number}] Login failed message detected")
-            
-            # Force logout and release number
-            complete_login_failed(login_id, number_id)
-            
-            session_path = os.path.join(SESSION_DIR, session_file)
-            try:
-                client = TelegramClient(session_path, api_id, api_hash)
-                await client.connect()
-                await client.log_out()
-                await client.disconnect()
-            except:
-                pass
-            
-            fail_text = (
-                f"❌ **লগইন ব্যর্থ!** ❌\n\n"
-                f"📱 নম্বর: `{number}`\n\n"
-                f"⚠️ **কারণ:** Telegram থেকে রিপোর্ট এসেছে যে\n"
-                f"লগইন সম্পন্ন হয়নি (পাসওয়ার্ড প্রয়োজন/ভুল)\n\n"
-                f"❌ অ্যাকাউন্ট **লগআউট** করা হয়েছে!\n"
-                f"নম্বরটি আবার **স্টকে** ফেরত দেওয়া হয়েছে।\n\n"
-                f"📞 নতুন করে কিনতে **/start** দিন"
-            )
-            
-            try:
-                await context.bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    text=fail_text,
-                    parse_mode='Markdown'
-                )
-            except:
-                await context.bot.send_message(chat_id=chat_id, text=fail_text, parse_mode='Markdown')
-            
-            # Notify admins
-            for admin_id in ADMIN_IDS:
-                try:
-                    await context.bot.send_message(
-                        chat_id=admin_id,
-                        text=f"⚠️ লগইন ব্যর্থ! নম্বর স্টকে ফেরত\n📱 `{number}`\n👤 `{user_id}`",
-                        parse_mode='Markdown'
-                    )
-                except:
-                    pass
-        
-        elif result == "LOGIN_SUCCESS":
-            logger.info(f"✅ [{number}] Login success message detected!")
-            
-            complete_login_success(login_id, number_id)
-            
-            success_text = (
-                f"✅ **লগইন সফল!** ✅\n\n"
-                f"📱 নম্বর: `{number}`\n\n"
-                f"🎉 **অভিনন্দন!**\n\n"
-                f"এই নম্বরটি এখন **আপনার**!\n"
-                f"✅ এটি আর কাউকে দেওয়া হবে না।\n"
-                f"🔒 সম্পূর্ণ নিরাপদ।\n\n"
-                f"📌 এখন আপনি Telegram ইউজ করতে পারবেন।\n\n"
-                f"❤️ **ধন্যবাদ!**"
-            )
-            
-            try:
-                await context.bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    text=success_text,
-                    parse_mode='Markdown'
-                )
-            except:
-                await context.bot.send_message(chat_id=chat_id, text=success_text, parse_mode='Markdown')
-            
-            # Notify admins
-            for admin_id in ADMIN_IDS:
-                try:
-                    await context.bot.send_message(
-                        chat_id=admin_id,
-                        text=f"✅ লগইন সফল! নম্বর সোল্ড!\n📱 `{number}`\n👤 `{user_id}`\n💰 নম্বরটি বিক্রি হয়ে গেছে!",
-                        parse_mode='Markdown'
-                    )
-                except:
-                    pass
-        
-        elif result == "TIMEOUT":
-            timeout_text = (
-                f"⏰ **টাইমআউট!** ⏰\n\n"
-                f"📱 নম্বর: `{number}`\n\n"
-                f"❌ ২ মিনিটের মধ্যে কোনো OTP আসেনি!\n\n"
-                f"কারণ:\n"
-                f"• Telegram অ্যাপে লগইন করেননি\n"
-                f"• অথবা নম্বরটি ব্লকেড\n\n"
-                f"🔄 আবার চেষ্টা করুন:"
-            )
-            
-            keyboard = [[InlineKeyboardButton("🔄 Start Login Again", callback_data="start_login")]]
-            
-            try:
-                await context.bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    text=timeout_text,
-                    parse_mode='Markdown',
-                    reply_markup=InlineKeyboardMarkup(keyboard)
-                )
-            except:
-                pass
-        
-        else:
-            # ERROR
-            err_text = (
-                f"❌ **এরর!**\n\n"
-                f"📱 নম্বর: `{number}`\n\n"
-                f"টেকনিক্যাল সমস্যা হয়েছে।\n"
-                f"সাপোর্টে জানান।\n\n"
-                f"Error: {result}"
-            )
-            
-            try:
-                await context.bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    text=err_text,
-                    parse_mode='Markdown'
-                )
-            except:
-                pass
-    
-    except Exception as e:
-        logger.error(f"OTP listener error: {e}")
-        try:
-            await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
-                text=f"❌ এরর!\n\n{str(e)[:100]}",
-                parse_mode='Markdown'
-            )
-        except:
-            pass
-
-async def handle_check_login(query, context):
-    """User says login is done - check if authorized"""
-    user_id = query.from_user.id
-    active = get_active_login_for_user(user_id)
-    
-    if not active:
-        # Maybe it's already marked success/failed
-        await safe_edit(query, 
-            "⏳ লগইন চেক করা হচ্ছে...\n\nআপনি সম্ভবত ইতিমধ্যে লগইন করেছেন।\nনতুন করে /start দিন।",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_main")]])
-        )
-        return
-    
-    number = active['number']
-    session_path = os.path.join(SESSION_DIR, active['session_file'])
-    
-    await safe_edit(query, 
-        "🔍 **চেক করা হচ্ছে...**\n\nঅনুগ্রহপূর্বক অপেক্ষা করুন...",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Check Again", callback_data="check_login")]])
-    )
-    
-    try:
-        client = TelegramClient(session_path, active['api_id'], active['api_hash'])
-        await client.connect()
-        
-        if await client.is_user_authorized():
-            # Login successful!
-            me = await client.get_me()
-            complete_login_success(active['id'], active['number_id'])
-            await client.disconnect()
-            
-            success_text = (
-                f"✅ **লগইন সফল!** ✅\n\n"
-                f"📱 নম্বর: `{number}`\n"
-                f"👤 নাম: {me.first_name}\n\n"
-                f"🎉 **অভিনন্দন!**\n"
-                f"এই নম্বরটি এখন **আপনার**!\n"
-                f"✅ আর কাউকে দেওয়া হবে না।\n\n"
-                f"❤️ ধন্যবাদ!"
-            )
-            
-            try:
-                await context.bot.edit_message_text(
-                    chat_id=query.message.chat_id,
-                    message_id=query.message.message_id,
-                    text=success_text,
-                    parse_mode='Markdown'
-                )
-            except:
-                await context.bot.send_message(chat_id=query.message.chat_id, text=success_text, parse_mode='Markdown')
-            
-            for admin_id in ADMIN_IDS:
-                try:
-                    await context.bot.send_message(
-                        chat_id=admin_id,
-                        text=f"✅ লগইন সফল! নম্বর সোল্ড!\n📱 `{number}`\n👤 `{user_id}`",
-                        parse_mode='Markdown'
-                    )
-                except:
-                    pass
-        else:
-            # Not authorized yet
-            not_ready_text = (
-                f"❌ **লগইন সম্পন্ন হয়নি!**\n\n"
-                f"📱 নম্বর: `{number}`\n\n"
-                f"আপনি এখনো OTP বসিয়ে লগইন করেননি\nঅথবা লগইন ব্যর্থ হয়েছে।\n\n"
-                f"🔄 আবার চেষ্টা করুন বা Gate OTP নিন:"
-            )
-            
-            keyboard = [
-                [InlineKeyboardButton("🔄 Gate OTP", callback_data="gate_otp")],
-                [InlineKeyboardButton("📲 Start Over", callback_data="start_login")]
-            ]
-            
-            try:
-                await context.bot.edit_message_text(
-                    chat_id=query.message.chat_id,
-                    message_id=query.message.message_id,
-                    text=not_ready_text,
-                    parse_mode='Markdown',
-                    reply_markup=InlineKeyboardMarkup(keyboard)
-                )
-            except:
-                pass
-            
-            await client.disconnect()
-    
-    except Exception as e:
-        logger.error(f"Check login error: {e}")
-        await safe_edit(query, 
-            f"❌ চেক করতে সমস্যা!\n\n{str(e)[:50]}",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Try Again", callback_data="check_login")]])
-        )
+    await safe_edit_caption(query, caption=f"✅ **Order Approved!**\n\n{order['package_name']}\n₹{order['price']}\nUser: {order['first_name']}")
 
 async def reject_order(query, context, order_id):
     order = get_order(order_id)
     if not order:
-        await safe_edit(query, "❌ অর্ডার পাওয়া যায়নি।")
+        await safe_edit(query, "❌ Order not found.")
         return
-    
     update_order_status(order_id, "rejected")
-    
     try:
-        await context.bot.send_message(chat_id=order["user_id"], text="❌ **পেমেন্ট রিজেক্ট!** সাপোর্টে যোগাযোগ করুন।")
-    except:
-        pass
-    
-    await safe_edit_caption(query, caption=f"❌ **রিজেক্টেড!**\n{order['package_name']}\n{order['first_name']}")
+        await context.bot.send_message(chat_id=order["user_id"], 
+                                       text="❌ **Payment Rejected.**\nContact support for details.")
+    except Exception as e:
+        logger.error(f"Could not notify user: {e}")
+    await safe_edit_caption(query, caption=f"❌ **Rejected!**\n{order['package_name']}\nUser: {order['first_name']}")
 
 async def block_user_from_order(query, context, order_id):
     order = get_order(order_id)
     if not order:
-        await safe_edit(query, "❌ অর্ডার পাওয়া যায়নি।")
+        await safe_edit(query, "❌ Order not found.")
         return
-    
     block_user(order["user_id"], order["first_name"], order.get("username", ""))
     update_order_status(order_id, "blocked")
-    await safe_edit_caption(query, caption=f"🚫 **ব্লক!**\n{order['first_name']}")
+    await safe_edit_caption(query, caption=f"🚫 **Blocked!**\n{order['first_name']} (ID: {order['user_id']})")
 
 async def back_to_main(query, context):
     keyboard = [
         [InlineKeyboardButton("📱 Buy Number", callback_data="buy_number")],
+        [InlineKeyboardButton("🎬 Buy Video", callback_data="buy_video")],
         [InlineKeyboardButton("📖 How To Use", callback_data="how_to_use")]
     ]
     if query.from_user.id in ADMIN_IDS:
         keyboard.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin_panel")])
     
-    try: await query.message.delete()
-    except: pass
-    await context.bot.send_message(chat_id=query.message.chat_id, text="👋 **স্বাগতম!**", reply_markup=InlineKeyboardMarkup(keyboard))
+    try:
+        await query.message.delete()
+    except:
+        pass
+    
+    welcome_text = (
+        "👋 **Welcome back!**\n\n"
+        "📱 Buy virtual numbers\n"
+        "🎬 Buy premium videos\n"
+        "📖 Learn how to use\n\n"
+        "Select an option below:"
+    )
+    await context.bot.send_message(
+        chat_id=query.message.chat_id,
+        text=welcome_text,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
-# ===================== ADMIN UI =====================
+# ===================== ADMIN PANEL =====================
+
 async def show_admin_panel(query, context):
     if query.from_user.id not in ADMIN_IDS:
         return
-    
     keyboard = [
-        [InlineKeyboardButton("📦 Products", callback_data="admin_products"), InlineKeyboardButton("📱 Stock", callback_data="admin_stock")],
-        [InlineKeyboardButton("💳 Payment", callback_data="admin_payment"), InlineKeyboardButton("📷 QR", callback_data="admin_qr")],
-        [InlineKeyboardButton("📦 Pending", callback_data="admin_pending"), InlineKeyboardButton("✅ Delivered", callback_data="admin_delivered")],
-        [InlineKeyboardButton("❌ Rejected", callback_data="admin_rejected"), InlineKeyboardButton("🚫 Blocked", callback_data="admin_blocked")],
-        [InlineKeyboardButton("👥 Users", callback_data="admin_users"), InlineKeyboardButton("📊 Stats", callback_data="admin_stats")],
+        [InlineKeyboardButton("📱 Number Products", callback_data="admin_numbers"), 
+         InlineKeyboardButton("🎬 Video Products", callback_data="admin_videos")],
+        [InlineKeyboardButton("💳 Payment Settings", callback_data="admin_payment"), 
+         InlineKeyboardButton("📷 QR Code", callback_data="admin_qr")],
+        [InlineKeyboardButton("📖 HowTo Video", callback_data="admin_howto")],
+        [InlineKeyboardButton("📝 Approval Msg", callback_data="admin_approval_msg")],
+        [InlineKeyboardButton("📦 Pending Orders", callback_data="admin_pending"), 
+         InlineKeyboardButton("✅ Approved", callback_data="admin_approved")],
+        [InlineKeyboardButton("❌ Rejected", callback_data="admin_rejected"), 
+         InlineKeyboardButton("🚫 Blocked Users", callback_data="admin_blocked")],
+        [InlineKeyboardButton("👥 Users", callback_data="admin_users"), 
+         InlineKeyboardButton("📊 Statistics", callback_data="admin_stats")],
         [InlineKeyboardButton("🔙 Back", callback_data="back_main")]
     ]
-    
-    await safe_edit(query, "⚙️ **Admin Panel**", reply_markup=InlineKeyboardMarkup(keyboard))
+    await safe_edit(query, "⚙️ **Admin Panel**\n\nAll controls are here — no commands needed!", reply_markup=InlineKeyboardMarkup(keyboard))
 
-async def admin_products(query, context):
+async def show_admin_approval_message(query, context):
+    """Show current approval message and option to edit it."""
     if query.from_user.id not in ADMIN_IDS:
         return
-    
-    products = get_products()
-    text = "📦 **প্যাকেজ সমূহ**\n\n"
-    
+    current_msg = get_setting("approval_message") or "Not set"
+    text = (
+        f"📝 **Approval Message Settings**\n\n"
+        f"**Current message:**\n```\n{current_msg}\n```\n\n"
+        f"**Available placeholders:**\n"
+        f"`{{first_name}}` — User's name\n"
+        f"`{{username}}` — @username\n"
+        f"`{{package_name}}` — Product name\n"
+        f"`{{price}}` — Amount paid\n"
+        f"`{{quantity}}` — Quantity\n"
+        f"`{{delivery_link}}` — Link (videos)\n"
+        f"`{{type}}` — 📱 or 🎬\n"
+        f"`{{order_id}}` — Order ID\n\n"
+        f"Tap below to change the message."
+    )
+    keyboard = [
+        [InlineKeyboardButton("✏️ Edit Approval Message", callback_data="edit_approval_msg")],
+        [InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]
+    ]
+    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def admin_number_products(query, context):
+    if query.from_user.id not in ADMIN_IDS:
+        return
+    products = get_products("number")
+    text = "📱 **Number Packages**\n\n"
     if not products:
-        text += "কোনো প্যাকেজ নেই।"
+        text += "No packages yet.\n"
     else:
         for p in products:
-            text += f"• **#{p['id']}**: {p['name']}\n  💰 ₹{p['price']} | 📦 {p.get('quantity', 1)} টি\n"
+            text += f"• **ID {p['id']}**: {p['name']}\n  💰 ₹{p['price']} | 📦 {p.get('quantity', 1)} numbers\n"
     
     keyboard = []
     row = []
     for p in products:
         row.append(InlineKeyboardButton(f"🗑️ #{p['id']}", callback_data=f"del_product_{p['id']}"))
-        if len(row) >= 2:
+        if len(row) == 2:
             keyboard.append(row)
             row = []
     if row:
         keyboard.append(row)
-    
-    keyboard.append([InlineKeyboardButton("➕ Add Package", callback_data="add_product")])
-    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="admin_panel")])
-    
+    keyboard.append([InlineKeyboardButton("➕ Add Number Package", callback_data="add_num_start")])
+    keyboard.append([InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")])
     await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
 
-async def admin_stock(query, context):
+async def admin_video_products(query, context):
     if query.from_user.id not in ADMIN_IDS:
         return
-    
-    text = (
-        f"📱 **নম্বর স্টক**\n\n"
-        f"📊 মোট: {get_total_number_count()}\n"
-        f"🟢 উপলব্ধ: {get_available_number_count()}\n"
-        f"🔴 সোল্ড: {get_sold_number_count()}\n"
-        f"🚫 ইনভ্যালিড: {get_invalid_number_count()}\n\n"
-    )
-    
-    nums = get_numbers_by_status('available', 10)
-    if nums:
-        text += "**উপলব্ধ:**\n"
-        for n in nums:
-            text += f"🆔 #{n['id']} • `{n['number']}`\n"
-    
-    keyboard = [
-        [InlineKeyboardButton("➕ Add Numbers", callback_data="admin_add_numbers")],
-    ]
-    if get_sold_number_count() > 0:
-        keyboard.append([InlineKeyboardButton("🔴 Sold", callback_data="admin_sold")])
-    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="admin_panel")])
-    
-    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
-
-async def admin_sold(query, context):
-    if query.from_user.id not in ADMIN_IDS:
-        return
-    
-    nums = get_numbers_by_status('sold', 30)
-    text = "🔴 **সোল্ড নম্বর**\n\n"
-    
-    if not nums:
-        text += "কিছু নেই।"
+    products = get_products("video")
+    text = "🎬 **Video Packages**\n\n"
+    if not products:
+        text += "No packages yet.\n"
     else:
-        for n in nums:
-            text += f"📱 `{n['number']}`\n  👤 `{n['sold_to']}`\n  🕐 {n['sold_at'][:19]}\n\n"
+        for p in products:
+            text += f"• **ID {p['id']}**: {p['name']}\n  💰 ₹{p['price']} | 🔗 {p.get('delivery_link', 'N/A')}\n"
     
-    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_stock")]]))
+    keyboard = []
+    row = []
+    for p in products:
+        row.append(InlineKeyboardButton(f"🗑️ #{p['id']}", callback_data=f"del_product_{p['id']}"))
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    keyboard.append([InlineKeyboardButton("➕ Add Video Package", callback_data="add_vid_start")])
+    keyboard.append([InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")])
+    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def show_admin_payment(query, context):
     if query.from_user.id not in ADMIN_IDS:
         return
-    
-    upi = get_setting("upi_id") or "customupi@bank"
-    text = f"💳 **পেমেন্ট**\n\n🏦 UPI: `{upi}`"
-    
-    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup([
-        [InlineKeyboardButton("✏️ Change", callback_data="edit_upi")],
-        [InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]
-    ]))
+    current_upi = get_setting("upi_id") or "customupi@bank"
+    text = (
+        f"💳 **Payment Settings**\n\n"
+        f"🏦 Current UPI ID: `{current_upi}`\n\n"
+        f"Tap the button below to change your UPI ID."
+    )
+    keyboard = [
+        [InlineKeyboardButton("✏️ Change UPI ID", callback_data="edit_upi")],
+        [InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]
+    ]
+    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def show_admin_qr(query, context):
     if query.from_user.id not in ADMIN_IDS:
         return
-    
     qr = get_setting("qr_code")
-    text = "📷 **QR**\n\n" + ("✅ সেট করা আছে।" if qr else "❌ সেট করা নেই।")
-    
-    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup([
-        [InlineKeyboardButton("✏️ Set", callback_data="edit_qr")],
-        [InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]
-    ]))
+    text = "📷 **QR Code Settings**\n\n"
+    text += "✅ QR Code is set.\n" if qr else "❌ No QR Code set.\n"
+    text += "\nTap the button to set a new QR code."
+    keyboard = [
+        [InlineKeyboardButton("✏️ Set QR Code", callback_data="edit_qr")],
+        [InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]
+    ]
+    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def show_admin_howto(query, context):
+    if query.from_user.id not in ADMIN_IDS:
+        return
+    vid = get_setting("how_to_use_video")
+    text = "📖 **How To Use Video**\n\n"
+    text += "✅ Video is set.\n" if vid else "❌ No video set.\n"
+    text += "\nTap the button to set a new how-to video."
+    keyboard = [
+        [InlineKeyboardButton("✏️ Set Video", callback_data="edit_howto")],
+        [InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]
+    ]
+    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def show_admin_orders(query, context, status):
     if query.from_user.id not in ADMIN_IDS:
         return
-    
     orders = get_orders_by_status(status)
-    emoji = {"pending": "📦", "delivered": "✅", "rejected": "❌"}.get(status, "📋")
-    status_bn = {"pending": "পেন্ডিং", "delivered": "ডেলিভারি", "rejected": "রিজেক্টেড"}.get(status, status)
-    
-    text = f"{emoji} **{status_bn} অর্ডার**\n\n"
-    
+    emoji = {"pending": "📦", "approved": "✅", "rejected": "❌"}.get(status, "📋")
+    text = f"{emoji} **{status.title()} Orders**\n\n"
     if not orders:
-        text += "কিছু নেই।"
+        text += "No orders found."
     else:
         for o in orders:
-            text += f"• {o['first_name']} - {o['package_name']} - ₹{o['price']}\n  🆔 {o['id']} | {o['created_at'][:19]}\n\n"
-    
-    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
+            text += f"• {o['first_name']} - {o['package_name']} - ₹{o['price']}\n  🆔 ID: {o['id']} | 🕐 {o['created_at'][:19]}\n\n"
+    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]]))
 
 async def show_blocked_users(query, context):
     if query.from_user.id not in ADMIN_IDS:
         return
-    
     blocked = get_blocked_users()
-    text = "🚫 **ব্লক করা ইউজার**\n\n"
-    
+    text = "🚫 **Blocked Users**\n\n"
     if not blocked:
-        text += "কেউ নেই।"
-        await safe_edit(query, text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
+        text += "No blocked users."
+        await safe_edit(query, text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]]))
         return
-    
     keyboard = []
     row = []
     for b in blocked:
         row.append(InlineKeyboardButton(f"🔓 {b['first_name']}", callback_data=f"unblock_{b['id']}"))
-        if len(row) >= 2:
+        if len(row) == 2:
             keyboard.append(row)
             row = []
     if row:
         keyboard.append(row)
-    
+    keyboard.append([InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")])
     for b in blocked:
-        text += f"• {b['first_name']} (@{b.get('username','N/A')}) - `{b['user_id']}`\n"
-    
-    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="admin_panel")])
+        text += f"• {b['first_name']} (@{b.get('username', 'N/A')}) - ID: {b['user_id']}\n"
     await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def show_users(query, context):
     if query.from_user.id not in ADMIN_IDS:
         return
-    
-    text = f"👥 **মোট ইউজার:** {count_users()}\n\n**সাম্প্রতিক:**\n"
+    text = f"👥 **Total Users:** {count_users()}\n\n**Recent Users:**\n"
     for u in get_recent_users(10):
-        spent = u.get('total_spent', 0) or 0
-        text += f"• {u['first_name']} (@{u.get('username','N/A')}) - ₹{spent}\n"
-    
-    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
+        text += f"• {u['first_name']} (@{u.get('username', 'N/A')})\n"
+    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]]))
 
 async def show_stats(query, context):
     if query.from_user.id not in ADMIN_IDS:
         return
-    
     text = (
-        f"📊 **স্ট্যাটিস্টিকস**\n\n"
-        f"📦 প্যাকেজ: {count_products()}\n"
-        f"👥 ইউজার: {count_users()}\n"
-        f"🚫 ব্লকড: {count_blocked()}\n"
-        f"📞 মোট স্টক: {get_total_number_count()}\n"
-        f"🟢 উপলব্ধ: {get_available_number_count()}\n"
-        f"🔴 সোল্ড: {get_sold_number_count()}\n"
-        f"🚫 ইনভ্যালিড: {get_invalid_number_count()}\n"
-        f"📦 মোট অর্ডার: {count_orders()}\n"
-        f"⏳ পেন্ডিং: {count_orders('pending')}\n"
-        f"✅ ডেলিভারি: {count_orders('delivered')}\n"
-        f"❌ রিজেক্টেড: {count_orders('rejected')}\n"
-        f"💰 **মোট আয়: ₹{get_total_revenue()}**"
+        f"📊 **Bot Statistics**\n\n"
+        f"📱 Number Packages: {count_products('number')}\n"
+        f"🎬 Video Packages: {count_products('video')}\n"
+        f"👥 Total Users: {count_users()}\n"
+        f"🚫 Blocked: {count_blocked()}\n\n"
+        f"📦 **Orders:**\n"
+        f"• Total: {count_orders()}\n"
+        f"• ⏳ Pending: {count_orders('pending')}\n"
+        f"• ✅ Approved: {count_orders('approved')}\n"
+        f"• ❌ Rejected: {count_orders('rejected')}\n"
     )
-    
-    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
+    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]]))
 
 # ===================== HEALTH SERVER =====================
+
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
         self.end_headers()
         self.wfile.write(b"OK")
-    def log_message(self, format, *args): pass
+    def log_message(self, format, *args):
+        pass
 
 def run_health_server():
     server = HTTPServer(('0.0.0.0', PORT), HealthHandler)
-    logger.info(f"✅ Health server on port {PORT}")
+    logger.info(f"Health server running on port {PORT}")
     server.serve_forever()
 
-# ===================== MAIN =====================
+# ===================== MAIN (Python 3.14 compatible) =====================
+
 _shutdown = False
 
 def signal_handler(sig, frame):
     global _shutdown
     _shutdown = True
-    logger.info("Shutdown signal received")
+    logger.info("Shutdown signal received, stopping bot...")
 
-async def main():
+async def run_bot():
+    """Async function to run the bot"""
+    global _shutdown
+    
     init_db()
+    logger.info("Database initialized")
     
-    health_thread = threading.Thread(target=run_health_server, daemon=True)
-    health_thread.start()
+    app = Application.builder().token(BOT_TOKEN).build()
     
-    application = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(button_callback))
+    app.add_handler(MessageHandler(filters.ALL, handle_messages))
     
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CallbackQueryHandler(button_callback))
-    application.add_handler(MessageHandler(filters.ALL, handle_messages))
+    logger.info("Bot started successfully!")
     
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling()
+    await app.initialize()
+    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+    await app.start()
     
-    logger.info("✅ Bot is running!")
+    logger.info("Bot is now polling for updates...")
     
-    while not _shutdown:
-        await asyncio.sleep(1)
-    
-    logger.info("Shutting down...")
-    await application.updater.stop()
-    await application.stop()
-    await application.shutdown()
+    try:
+        while not _shutdown:
+            await asyncio.sleep(1)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        logger.info("Shutting down bot...")
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+        logger.info("Bot shutdown complete.")
 
-if __name__ == "__main__":
+def main():
+    """Main entry point with proper asyncio event loop"""
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
     try:
-        asyncio.run(main())
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(run_bot())
     except KeyboardInterrupt:
-        pass
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
     finally:
-        logger.info("Bot stopped.")
+        try:
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            loop.close()
+        except:
+            pass
+        logger.info("Main thread exiting.")
+
+if __name__ == "__main__":
+    health_thread = threading.Thread(target=run_health_server, daemon=True)
+    health_thread.start()
+    main()
