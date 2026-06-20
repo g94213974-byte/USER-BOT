@@ -3,31 +3,26 @@ import datetime
 import logging
 import os
 import threading
-import random
+import re
 import asyncio
 import signal
-import re
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from telegram.error import Conflict
 from telethon import TelegramClient, events
-from telethon.errors import SessionPasswordNeededError
+from telethon.errors import RPCError
 
 # ===================== CONFIG =====================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(","))) if os.getenv("ADMIN_IDS") else []
 PORT = int(os.getenv("PORT", 10000))
 
-# Telethon credentials (User Account - for OTP catching)
-API_ID = int(os.getenv("API_ID", 0))  # my.telegram.org থেকে নাও
-API_HASH = os.getenv("API_HASH", "")
-PHONE_NUMBER = os.getenv("PHONE_NUMBER", "")  # OTP catcher account number
+SESSION_DIR = "sessions"
+os.makedirs(SESSION_DIR, exist_ok=True)
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN environment variable is not set!")
-if not API_ID or not API_HASH:
-    raise ValueError("API_ID and API_HASH must be set! Get from my.telegram.org")
 
 # ===================== LOGGING =====================
 logging.basicConfig(
@@ -36,7 +31,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ===================== DATABASE (Thread-Safe) =====================
+# ===================== DATABASE =====================
 DB_FILE = "bot_data.db"
 _db_lock = threading.Lock()
 
@@ -55,11 +50,30 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT, name TEXT, price REAL, quantity INTEGER DEFAULT 1, delivery_link TEXT DEFAULT '', position INTEGER)''')
     c.execute('''CREATE TABLE IF NOT EXISTS blocked_users (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, first_name TEXT, username TEXT, blocked_at TEXT)''')
     
-    # Number Pool - এখানে Admin যে নাম্বারগুলো LOGIN করে রেখেছে সেগুলো থাকবে
-    c.execute('''CREATE TABLE IF NOT EXISTS number_pool (id INTEGER PRIMARY KEY AUTOINCREMENT, number TEXT UNIQUE, status TEXT DEFAULT 'available', assigned_to INTEGER DEFAULT NULL, chat_id INTEGER DEFAULT NULL, assigned_at TEXT DEFAULT NULL)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS number_pool (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, 
+        number TEXT UNIQUE, 
+        api_id INTEGER,
+        api_hash TEXT,
+        session_file TEXT,
+        status TEXT DEFAULT 'available', 
+        assigned_to INTEGER DEFAULT NULL, 
+        assigned_at TEXT DEFAULT NULL,
+        last_active DATETIME DEFAULT NULL,
+        login_valid INTEGER DEFAULT 1
+    )''')
     
-    # OTP Records
-    c.execute('''CREATE TABLE IF NOT EXISTS otp_records (id INTEGER PRIMARY KEY AUTOINCREMENT, number TEXT, user_id INTEGER, otp_code TEXT, sender TEXT DEFAULT '', status TEXT DEFAULT 'received', forwarded_at TEXT DEFAULT NULL, created_at TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS otp_records (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, 
+        number_id INTEGER,
+        number TEXT, 
+        user_id INTEGER, 
+        otp_code TEXT, 
+        sender TEXT DEFAULT '', 
+        status TEXT DEFAULT 'received', 
+        forwarded_at TEXT DEFAULT NULL, 
+        created_at TEXT
+    )''')
     
     defaults = {"upi_id": "customupi@bank", "qr_code": "", "how_to_use_video": ""}
     for k, v in defaults.items():
@@ -67,7 +81,7 @@ def init_db():
     conn.commit()
     conn.close()
 
-# ---------- SETTINGS ----------
+# ===================== DB FUNCTIONS =====================
 def get_setting(key):
     with _db_lock:
         conn = get_db()
@@ -85,7 +99,6 @@ def update_setting(key, value):
         conn.commit()
         conn.close()
 
-# ---------- USERS ----------
 def save_user(user_id, first_name, username):
     with _db_lock:
         conn = get_db()
@@ -113,7 +126,7 @@ def get_recent_users(limit=10):
         conn.close()
         return results
 
-# ---------- PRODUCTS ----------
+# ===================== PRODUCTS =====================
 def add_product(type_name, name, price, extra):
     with _db_lock:
         conn = get_db()
@@ -164,7 +177,7 @@ def count_products(type_name):
         conn.close()
         return result
 
-# ---------- ORDERS ----------
+# ===================== ORDERS =====================
 def create_order(user_id, first_name, username, p_type, package_id, package_name, price, quantity, delivery_link, screenshot_id):
     with _db_lock:
         conn = get_db()
@@ -223,7 +236,7 @@ def count_orders(status=None):
         conn.close()
         return result
 
-# ---------- BLOCK ----------
+# ===================== BLOCK =====================
 def block_user(user_id, first_name, username):
     with _db_lock:
         conn = get_db()
@@ -270,19 +283,16 @@ def count_blocked():
         conn.close()
         return result
 
-# ===================== NUMBER POOL FUNCTIONS =====================
-# এখানে Admin LOGIN করা নাম্বারগুলো store করবে
-# status = 'available' means OTP catcher account এ নাম্বারটা LOGIN করা আছে এবং কাউকে assign করা হয়নি
-# status = 'assigned' means user কে দেওয়া হয়েছে
-
-def add_number_to_pool(number, chat_id=None):
-    """Admin manually adds a number that's LOGGED IN on the OTP catcher account"""
+# ===================== NUMBER POOL =====================
+def add_number_to_pool(number, api_id, api_hash, session_file):
     with _db_lock:
         conn = get_db()
         c = conn.cursor()
         try:
-            c.execute("INSERT INTO number_pool (number, status, chat_id) VALUES (?, 'available', ?)", 
-                      (number.strip(), chat_id))
+            c.execute(
+                "INSERT INTO number_pool (number, api_id, api_hash, session_file, status, login_valid) VALUES (?, ?, ?, ?, 'available', 1)", 
+                (number.strip(), api_id, api_hash, session_file)
+            )
             conn.commit()
             conn.close()
             return True
@@ -290,61 +300,65 @@ def add_number_to_pool(number, chat_id=None):
             conn.close()
             return False
 
-def add_bulk_numbers(numbers_text):
-    """Add multiple numbers"""
-    added = 0
-    failed = 0
-    numbers = re.split(r'[\n,]+', numbers_text)
-    for num in numbers:
-        num = num.strip()
-        if num:
-            # Format: number or number:chat_id
-            parts = num.split(":")
-            number = parts[0].strip()
-            chat_id = int(parts[1].strip()) if len(parts) > 1 and parts[1].strip().lstrip('-').isdigit() else None
-            if add_number_to_pool(number, chat_id):
-                added += 1
-            else:
-                failed += 1
-    return added, failed
-
 def get_available_numbers(limit=100):
     with _db_lock:
         conn = get_db()
         c = conn.cursor()
-        c.execute("SELECT * FROM number_pool WHERE status = 'available' LIMIT ?", (limit,))
+        c.execute("SELECT * FROM number_pool WHERE status = 'available' AND login_valid = 1 LIMIT ?", (limit,))
         results = [dict(row) for row in c.fetchall()]
         conn.close()
         return results
 
 def assign_number_to_user(number_id, user_id):
-    """Assign a number to a user"""
     with _db_lock:
         conn = get_db()
         c = conn.cursor()
-        c.execute("UPDATE number_pool SET status = 'assigned', assigned_to = ?, assigned_at = ? WHERE id = ? AND status = 'available'",
-                  (user_id, datetime.datetime.now().isoformat(), number_id))
+        c.execute("UPDATE number_pool SET status = 'assigned', assigned_to = ?, assigned_at = ?, last_active = ? WHERE id = ? AND status = 'available'",
+                  (user_id, datetime.datetime.now().isoformat(), datetime.datetime.now().isoformat(), number_id))
         affected = c.rowcount
         conn.commit()
         conn.close()
         return affected > 0
 
-def get_assigned_numbers_for_user(user_id):
-    """Get all numbers assigned to a user"""
+def get_assigned_number_for_user(user_id):
     with _db_lock:
         conn = get_db()
         c = conn.cursor()
         c.execute("SELECT * FROM number_pool WHERE assigned_to = ? AND status = 'assigned'", (user_id,))
-        results = [dict(row) for row in c.fetchall()]
+        row = c.fetchone()
         conn.close()
-        return results
+        return dict(row) if row else None
 
-def release_number(number_id):
-    """Release number back to pool"""
+def get_number_by_id(number_id):
     with _db_lock:
         conn = get_db()
         c = conn.cursor()
-        c.execute("UPDATE number_pool SET status = 'available', assigned_to = NULL, assigned_at = NULL WHERE id = ?", (number_id,))
+        c.execute("SELECT * FROM number_pool WHERE id = ?", (number_id,))
+        row = c.fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+def mark_number_invalid(number_id):
+    with _db_lock:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("UPDATE number_pool SET login_valid = 0, status = 'invalid' WHERE id = ?", (number_id,))
+        conn.commit()
+        conn.close()
+
+def mark_number_valid(number_id):
+    with _db_lock:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("UPDATE number_pool SET login_valid = 1 WHERE id = ?", (number_id,))
+        conn.commit()
+        conn.close()
+
+def release_number(number_id):
+    with _db_lock:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("UPDATE number_pool SET status = 'available', assigned_to = NULL, assigned_at = NULL, login_valid = 1 WHERE id = ?", (number_id,))
         conn.commit()
         conn.close()
 
@@ -352,7 +366,7 @@ def count_available_numbers():
     with _db_lock:
         conn = get_db()
         c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM number_pool WHERE status = 'available'")
+        c.execute("SELECT COUNT(*) FROM number_pool WHERE status = 'available' AND login_valid = 1")
         result = c.fetchone()[0]
         conn.close()
         return result
@@ -375,25 +389,31 @@ def count_assigned_numbers():
         conn.close()
         return result
 
-def get_number_by_value(number_str):
-    """Find a number in pool by its value"""
+def count_invalid_numbers():
     with _db_lock:
         conn = get_db()
         c = conn.cursor()
-        c.execute("SELECT * FROM number_pool WHERE number = ?", (number_str,))
-        row = c.fetchone()
+        c.execute("SELECT COUNT(*) FROM number_pool WHERE login_valid = 0")
+        result = c.fetchone()[0]
         conn.close()
-        return dict(row) if row else None
+        return result
+
+def get_all_connected_numbers():
+    with _db_lock:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("SELECT id, number, api_id, api_hash, session_file FROM number_pool WHERE login_valid = 1")
+        results = [dict(row) for row in c.fetchall()]
+        conn.close()
+        return results
 
 # ===================== OTP FUNCTIONS =====================
-
-def save_otp_record(number, user_id, otp_text, sender=""):
-    """Save OTP received from the catcher account"""
+def save_otp_record(number_id, number, user_id, otp_text, sender=""):
     with _db_lock:
         conn = get_db()
         c = conn.cursor()
-        c.execute("INSERT INTO otp_records (number, user_id, otp_code, sender, status, created_at) VALUES (?, ?, ?, ?, 'received', ?)",
-                  (number, user_id, otp_text, sender, datetime.datetime.now().isoformat()))
+        c.execute("INSERT INTO otp_records (number_id, number, user_id, otp_code, sender, status, created_at) VALUES (?, ?, ?, ?, ?, 'received', ?)",
+                  (number_id, number, user_id, otp_text, sender, datetime.datetime.now().isoformat()))
         otp_id = c.lastrowid
         conn.commit()
         conn.close()
@@ -423,13 +443,333 @@ async def safe_edit_caption(query, caption, reply_markup=None):
         if "Message is not modified" not in str(e):
             logger.error(f"safe_edit_caption error: {e}")
 
-# ===================== BOT HANDLERS =====================
+# ===================== TELETHON CLIENT =====================
 
+class NumberClient:
+    def __init__(self, number_id, number, api_id, api_hash, session_file):
+        self.number_id = number_id
+        self.number = number
+        self.api_id = api_id
+        self.api_hash = api_hash
+        self.session_file = session_file
+        self.client = None
+        self.task = None
+        self._running = False
+    
+    async def start(self):
+        self._running = True
+        session_path = os.path.join(SESSION_DIR, self.session_file)
+        
+        try:
+            self.client = TelegramClient(session_path, self.api_id, self.api_hash)
+            await self.client.start()
+            me = await self.client.get_me()
+            logger.info(f"✅ [{self.number}] Connected as: {me.first_name}")
+            
+            mark_number_valid(self.number_id)
+            
+            @self.client.on(events.NewMessage)
+            async def handler(event):
+                await self.handle_message(event)
+            
+            # Keep alive and check connection
+            while self._running:
+                try:
+                    if not await self.client.is_user_authorized():
+                        logger.warning(f"⚠️ [{self.number}] Session expired!")
+                        mark_number_invalid(self.number_id)
+                        await self.notify_admins_logout()
+                        break
+                    
+                    with _db_lock:
+                        conn = get_db()
+                        c = conn.cursor()
+                        c.execute("UPDATE number_pool SET last_active = ? WHERE id = ?",
+                                  (datetime.datetime.now().isoformat(), self.number_id))
+                        conn.commit()
+                        conn.close()
+                    
+                    await asyncio.sleep(60)
+                except RPCError as e:
+                    logger.error(f"⚠️ [{self.number}] RPC Error: {e}")
+                    if "AUTH_KEY_UNREGISTERED" in str(e) or "SESSION_REVOKED" in str(e):
+                        logger.warning(f"🚫 [{self.number}] Session revoked!")
+                        mark_number_invalid(self.number_id)
+                        await self.notify_admins_logout()
+                        break
+                    await asyncio.sleep(10)
+                except Exception as e:
+                    logger.error(f"[{self.number}] Keep-alive error: {e}")
+                    await asyncio.sleep(10)
+        
+        except Exception as e:
+            error_str = str(e)
+            logger.error(f"❌ [{self.number}] Failed: {error_str}")
+            if "AUTH_KEY_UNREGISTERED" in error_str or "SESSION_REVOKED" in error_str:
+                mark_number_invalid(self.number_id)
+                await self.notify_admins_logout()
+    
+    async def handle_message(self, event):
+        try:
+            sender = await event.get_sender()
+            message_text = event.raw_text
+            if not message_text:
+                return
+            
+            sender_name = sender.first_name if sender else "Unknown"
+            logger.info(f"📩 [{self.number}] Message: {message_text[:80]}...")
+            
+            # ===== CHECK IF THIS IS A LOGIN ALERT =====
+            login_alert_patterns = [
+                r'code:\s*(\d{4,8})',
+                r'login\s*code[:\s]+(\d{4,8})',
+                r'verification\s*code[:\s]+(\d{4,8})',
+                r'Your verification code is:?\s*(\d{4,8})',
+                r'Login code:?\s*(\d{4,8})',
+                r'Your code is:?\s*(\d{4,8})',
+            ]
+            
+            is_login_alert = False
+            login_code = None
+            
+            for pattern in login_alert_patterns:
+                match = re.search(pattern, message_text, re.IGNORECASE)
+                if match:
+                    is_login_alert = True
+                    login_code = match.group(1)
+                    break
+            
+            if not is_login_alert:
+                login_keywords = ['logged in', 'new device', 'new login', 'sign in', 'logged into', 'device logged']
+                if any(kw in message_text.lower() for kw in login_keywords):
+                    code_match = re.search(r'(\d{4,8})', message_text)
+                    if code_match:
+                        is_login_alert = True
+                        login_code = code_match.group(1)
+            
+            # ===== CHECK NUMBER STATUS =====
+            with _db_lock:
+                conn = get_db()
+                c = conn.cursor()
+                c.execute("SELECT * FROM number_pool WHERE id = ?", (self.number_id,))
+                num_row = c.fetchone()
+                conn.close()
+            
+            if not num_row:
+                return
+            
+            is_assigned = (num_row['status'] == 'assigned')
+            is_available = (num_row['status'] == 'available')
+            
+            # ===== IF LOGIN ALERT DETECTED =====
+            if is_login_alert and login_code:
+                logger.info(f"⚠️ [{self.number}] Login alert! Code: {login_code}")
+                
+                from telegram import Bot
+                bot = Bot(token=BOT_TOKEN)
+                
+                if is_assigned:
+                    user_id = num_row['assigned_to']
+                    
+                    # Step 1: Send login code to user
+                    login_text = (
+                        f"📲 **Login Code Received!** 📩\n\n"
+                        f"📱 Number: `{self.number}`\n"
+                        f"🔑 **Code:** `{login_code}`\n\n"
+                        f"⚠️ Use this code to login to your app!\n"
+                        f"⏳ Hurry, it expires soon!"
+                    )
+                    try:
+                        await bot.send_message(chat_id=user_id, text=login_text, parse_mode='Markdown')
+                        logger.info(f"✅ [{self.number}] Code sent to user {user_id}")
+                    except Exception as e:
+                        logger.error(f"❌ [{self.number}] Code send failed: {e}")
+                    
+                    # Step 2: Wait 3 seconds then auto-logout
+                    await asyncio.sleep(3)
+                    
+                    logger.info(f"🚫 [{self.number}] Auto-logging out assigned number...")
+                    try:
+                        await self.client.log_out()
+                        logger.info(f"✅ [{self.number}] Logged out!")
+                        mark_number_invalid(self.number_id)
+                        
+                        try:
+                            await bot.send_message(
+                                chat_id=user_id,
+                                text=f"🚫 **Session Ended**\n\n📱 `{self.number}`\n✅ Account logged out automatically.\n\nOnly 1 user per number is allowed.",
+                                parse_mode='Markdown'
+                            )
+                        except:
+                            pass
+                        
+                        for admin_id in ADMIN_IDS:
+                            try:
+                                await bot.send_message(
+                                    chat_id=admin_id,
+                                    text=f"🔄 **Auto-Logout**\n\n📱 `{self.number}`\n🔑 Code: `{login_code}`\n👤 User: `{user_id}`\n✅ Done!",
+                                    parse_mode='Markdown'
+                                )
+                            except:
+                                pass
+                        
+                    except Exception as e:
+                        logger.error(f"❌ [{self.number}] Logout failed: {e}")
+                        try:
+                            await self.client.disconnect()
+                            mark_number_invalid(self.number_id)
+                        except:
+                            pass
+                    
+                    self._running = False
+                    
+                elif is_available:
+                    # Available number - just log it, don't logout
+                    logger.info(f"ℹ️ [{self.number}] Login alert on available number - ignoring")
+                    for admin_id in ADMIN_IDS:
+                        try:
+                            await bot.send_message(
+                                chat_id=admin_id,
+                                text=f"ℹ️ **Login Alert** (Available)\n\n📱 `{self.number}`\n🔑 Code: `{login_code}`\n\nNot assigned yet. No action taken.",
+                                parse_mode='Markdown'
+                            )
+                        except:
+                            pass
+                
+                return  # Don't process as OTP
+            
+            # ===== NORMAL OTP PROCESSING =====
+            if not is_assigned:
+                return
+            
+            user_id = num_row['assigned_to']
+            
+            otp_match = re.search(r'(\d{4,8})', message_text)
+            otp_code = otp_match.group(1) if otp_match else message_text
+            
+            otp_id = save_otp_record(self.number_id, self.number, user_id, message_text, sender_name)
+            
+            from telegram import Bot
+            bot = Bot(token=BOT_TOKEN)
+            
+            forward_text = (
+                f"🔐 **OTP Received!** 📩\n\n"
+                f"📱 **Number:** `{self.number}`\n"
+                f"🔑 **OTP:** `{otp_code}`\n"
+                f"👤 **From:** {sender_name}\n"
+                f"📨 **Message:** `{message_text}`\n\n"
+                f"⚡ Use quickly!"
+            )
+            
+            try:
+                await bot.send_message(chat_id=user_id, text=forward_text, parse_mode='Markdown')
+                mark_otp_forwarded(otp_id)
+                logger.info(f"✅ [{self.number}] OTP forwarded to {user_id}")
+            except Exception as e:
+                logger.error(f"❌ [{self.number}] Forward failed: {e}")
+            
+            for admin_id in ADMIN_IDS:
+                try:
+                    await bot.send_message(
+                        chat_id=admin_id,
+                        text=f"🔄 **OTP Forwarded!**\n📱 {self.number}\n🔑 `{otp_code}`\n👤 User: `{user_id}`",
+                        parse_mode='Markdown'
+                    )
+                except:
+                    pass
+        
+        except Exception as e:
+            logger.error(f"Error in handler [{self.number}]: {e}")
+    
+    async def notify_admins_logout(self):
+        from telegram import Bot
+        bot = Bot(token=BOT_TOKEN)
+        
+        with _db_lock:
+            conn = get_db()
+            c = conn.cursor()
+            c.execute("SELECT * FROM number_pool WHERE id = ?", (self.number_id,))
+            row = c.fetchone()
+            conn.close()
+        
+        user_info = ""
+        if row and row['assigned_to']:
+            user_info = f"\n👤 Assigned: `{row['assigned_to']}`"
+        
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    chat_id=admin_id,
+                    text=f"🚫 **Number Lost**\n\n📱 `{self.number}`❌ Session expired{user_info}\n\nRe-add with valid credentials.",
+                    parse_mode='Markdown'
+                )
+            except:
+                pass
+        
+        if row and row['assigned_to'] and row['status'] == 'assigned':
+            try:
+                await bot.send_message(
+                    chat_id=row['assigned_to'],
+                    text=f"🚫 **Number Lost**\n\n📱 `{self.number}`\n❌ Session expired.\n\nContact support.",
+                    parse_mode='Markdown'
+                )
+            except:
+                pass
+    
+    async def stop(self):
+        self._running = False
+        if self.client:
+            await self.client.disconnect()
+            logger.info(f"⏹️ [{self.number}] Disconnected")
+
+# ===================== CLIENT MANAGER =====================
+active_clients = []
+_clients_lock = threading.Lock()
+
+async def start_all_number_clients():
+    numbers = get_all_connected_numbers()
+    
+    for num in numbers:
+        already_running = False
+        with _clients_lock:
+            for c in active_clients:
+                if c.number_id == num['id'] and c._running:
+                    already_running = True
+                    break
+        if already_running:
+            continue
+        
+        client = NumberClient(
+            num['id'], 
+            num['number'],
+            num['api_id'], 
+            num['api_hash'], 
+            num.get('session_file', f'session_{num["number"]}.session')
+        )
+        
+        task = asyncio.create_task(client.start())
+        client.task = task
+        
+        with _clients_lock:
+            active_clients.append(client)
+        
+        await asyncio.sleep(0.3)
+    
+    logger.info(f"✅ Started {len(numbers)} clients")
+
+async def stop_all_number_clients():
+    with _clients_lock:
+        for client in active_clients:
+            await client.stop()
+        active_clients.clear()
+    logger.info("⏹️ All clients stopped")
+
+# ===================== BOT HANDLERS =====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     save_user(user.id, user.first_name, user.username)
     if is_blocked(user.id):
-        await update.message.reply_text("⛔ You have been blocked.")
+        await update.message.reply_text("⛔ Blocked.")
         return
     
     keyboard = [
@@ -440,21 +780,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user.id in ADMIN_IDS:
         keyboard.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin_panel")])
     
-    welcome_text = (
-        "👋 **Welcome to the Bot!**\n\n"
-        "📱 Buy virtual numbers\n"
-        "🎬 Buy premium videos\n"
-        "📖 Learn how to use\n\n"
-        "Select an option below:"
+    await update.message.reply_text(
+        "👋 **Welcome!**\n\n📱 Buy virtual numbers\n🎬 Buy premium videos\n📖 Learn how to use\n\nSelect below:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
-    await update.message.reply_text(welcome_text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
     if is_blocked(user_id):
-        await safe_edit(query, "⛔ You have been blocked.")
+        await safe_edit(query, "⛔ Blocked.")
         return
     data = query.data
     
@@ -478,13 +814,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["waiting_for_screenshot"] = False
         context.user_data["pending_pkg_id"] = None
         context.user_data["pending_type"] = None
-        await safe_edit(query, "❌ Payment cancelled.")
+        await safe_edit(query, "❌ Cancelled.")
     elif data.startswith("pay_"):
         parts = data.split("_")
         context.user_data["pending_pkg_id"] = int(parts[2])
         context.user_data["pending_type"] = parts[1]
         context.user_data["waiting_for_screenshot"] = True
-        await safe_edit(query, "📸 Please send your payment screenshot.\n\n❌ Press below to cancel:", 
+        await safe_edit(query, "📸 Send payment screenshot.\n\n❌ Cancel:", 
                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_payment")]]))
     elif data.startswith("approve_"):
         await approve_order(query, context, int(data.replace("approve_", "")))
@@ -494,18 +830,18 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await block_user_from_order(query, context, int(data.replace("block_", "")))
     elif data.startswith("unblock_"):
         unblock_user(int(data.replace("unblock_", "")))
-        await safe_edit(query, "✅ User has been unblocked.")
+        await safe_edit(query, "✅ Unblocked.")
     elif data == "admin_panel":
         await show_admin_panel(query, context)
     elif data.startswith("del_product_"):
         if query.from_user.id in ADMIN_IDS:
-            product_id = int(data.replace("del_product_", ""))
-            product = get_product(product_id)
-            delete_product(product_id)
-            await safe_edit(query, f"✅ Product deleted!")
-            if product and product['type'] == 'number':
+            pid = int(data.replace("del_product_", ""))
+            prod = get_product(pid)
+            delete_product(pid)
+            await safe_edit(query, "✅ Deleted!")
+            if prod and prod['type'] == 'number':
                 await admin_number_products(query, context)
-            elif product and product['type'] == 'video':
+            elif prod and prod['type'] == 'video':
                 await admin_video_products(query, context)
     elif data == "admin_numbers":
         await admin_number_products(query, context)
@@ -535,17 +871,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if query.from_user.id in ADMIN_IDS:
             context.user_data["waiting_for_numbers_bulk"] = True
             await safe_edit(query, 
-                "✏️ Send numbers to add to pool.\n\n"
-                "Format: এক লাইনে একটা নাম্বার\n"
-                "Optional: number:chat_id (OTP যে chat থেকে আসবে)\n\n"
-                "Example:\n"
-                "+8801234567890\n"
-                "+8801987654321\n"
-                "+8801711111111:-100123456789\n\n"
-                "❌ /cancel to cancel")
-    elif data == "admin_my_numbers":
+                "✏️ **Add Number**\n\nFormat:\n`phone:api_id:api_hash`\n\nExample:\n`+8801234567890:123456:abcdef`\n\nMultiple lines:\n`+8801234567890:123456:hash1`\n`+8801987654321:789012:hash2`\n\n❌ /cancel")
+    elif data == "admin_invalid_numbers":
         if query.from_user.id in ADMIN_IDS:
-            await show_my_assigned_numbers(query, context)
+            await show_invalid_numbers(query, context)
     elif data.startswith("del_pool_num_"):
         if query.from_user.id in ADMIN_IDS:
             num_id = int(data.replace("del_pool_num_", ""))
@@ -555,35 +884,32 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 c.execute("DELETE FROM number_pool WHERE id = ?", (num_id,))
                 conn.commit()
                 conn.close()
-            await safe_edit(query, "✅ Number removed from pool!")
+            await safe_edit(query, "✅ Removed!")
             await show_number_pool_admin(query, context)
 
 async def show_how_to_use(query, context):
     video_id = get_setting("how_to_use_video")
     if video_id:
         try:
-            await context.bot.send_video(chat_id=query.message.chat_id, video=video_id, 
-                                         caption="📖 Watch this video to learn how to use the bot.")
-        except Exception as e:
-            logger.error(f"Error sending how-to video: {e}")
-    await safe_edit(query, "📖 How To Use\n\nWatch the video above to learn how to use the bot.", 
+            await context.bot.send_video(chat_id=query.message.chat_id, video=video_id, caption="📖 How to use video.")
+        except:
+            pass
+    await safe_edit(query, "📖 How To Use\n\nWatch video above.", 
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_main")]]))
 
 async def show_number_products(query, context):
     products = get_products("number")
     if not products:
-        await safe_edit(query, "❌ No number packages available yet.", 
+        await safe_edit(query, "❌ No packages yet.", 
                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_main")]]))
         return
-    text = "📱 **Number Packages**\n\nSelect a package below:"
+    text = "📱 **Number Packages**\n\nSelect:"
     keyboard = []
     row = []
     for p in products:
-        btn = InlineKeyboardButton(f"{p['name']} - ₹{p['price']}", callback_data=f"num_pkg_{p['id']}")
-        row.append(btn)
+        row.append(InlineKeyboardButton(f"{p['name']} - ₹{p['price']}", callback_data=f"num_pkg_{p['id']}"))
         if len(row) == 2:
-            keyboard.append(row)
-            row = []
+            keyboard.append(row); row = []
     if row:
         keyboard.append(row)
     keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_main")])
@@ -592,18 +918,16 @@ async def show_number_products(query, context):
 async def show_video_products(query, context):
     products = get_products("video")
     if not products:
-        await safe_edit(query, "❌ No video packages available yet.", 
+        await safe_edit(query, "❌ No packages yet.", 
                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_main")]]))
         return
-    text = "🎬 **Video Packages**\n\nSelect a package below:"
+    text = "🎬 **Video Packages**\n\nSelect:"
     keyboard = []
     row = []
     for p in products:
-        btn = InlineKeyboardButton(f"{p['name']} - ₹{p['price']}", callback_data=f"vid_pkg_{p['id']}")
-        row.append(btn)
+        row.append(InlineKeyboardButton(f"{p['name']} - ₹{p['price']}", callback_data=f"vid_pkg_{p['id']}"))
         if len(row) == 2:
-            keyboard.append(row)
-            row = []
+            keyboard.append(row); row = []
     if row:
         keyboard.append(row)
     keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_main")])
@@ -612,57 +936,35 @@ async def show_video_products(query, context):
 async def show_payment(query, context, p_type, pkg_id):
     product = get_product(pkg_id)
     if not product:
-        await safe_edit(query, "❌ Package not found.")
+        await safe_edit(query, "❌ Not found.")
         return
     upi_id = get_setting("upi_id") or "customupi@bank"
     qr_code = get_setting("qr_code")
     
     payment_text = (
-        f"💳 **Payment Details**\n\n"
-        f"📦 Package: {product['name']}\n"
-        f"💰 Amount: ₹{product['price']}\n"
-        f"🏦 UPI ID: `{upi_id}`\n\n"
-        f"📱 Pay using PhonePe / GPay / Paytm\n\n"
-        f"⚠️ Pay the EXACT amount shown above"
+        f"💳 **Payment**\n\n📦 {product['name']}\n💰 ₹{product['price']}\n🏦 UPI: `{upi_id}`\n\n📱 Pay using GPay/PhonePe/Paytm\n⚠️ Pay EXACT amount"
     )
     
     keyboard = [
         [InlineKeyboardButton("📸 I Have Paid", callback_data=f"pay_{p_type}_{pkg_id}")],
         [InlineKeyboardButton("🔙 Back", callback_data=f"back_{p_type}s")]
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
     
     if qr_code:
         try:
-            try:
-                await query.message.delete()
-            except:
-                pass
-            await context.bot.send_photo(
-                chat_id=query.message.chat_id, 
-                photo=qr_code, 
-                caption=payment_text, 
-                reply_markup=reply_markup, 
-                parse_mode='Markdown'
-            )
+            try: await query.message.delete()
+            except: pass
+            await context.bot.send_photo(chat_id=query.message.chat_id, photo=qr_code, caption=payment_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
             return
-        except Exception as e:
-            logger.error(f"Error sending QR: {e}")
+        except:
+            pass
     
-    try:
-        await query.message.delete()
-    except:
-        pass
-    await context.bot.send_message(
-        chat_id=query.message.chat_id,
-        text=payment_text,
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
-    )
+    try: await query.message.delete()
+    except: pass
+    await context.bot.send_message(chat_id=query.message.chat_id, text=payment_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
-# ===================== MESSAGE HANDLER =====
+# ===================== MESSAGE HANDLER =====================
 async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles ALL user inputs"""
     user = update.effective_user
     
     if update.message.text and update.message.text.strip() == "/cancel":
@@ -674,165 +976,166 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Cancelled.")
         return
     
-    # ===== ADMIN: ADD BULK NUMBERS =====
+    # ADMIN: ADD BULK NUMBERS
     if context.user_data.get("waiting_for_numbers_bulk") and user.id in ADMIN_IDS:
         text = update.message.text.strip()
-        added, failed = add_bulk_numbers(text)
+        lines = text.strip().split('\n')
+        added = 0; failed = 0
+        
+        for line in lines:
+            line = line.strip()
+            if not line: continue
+            parts = line.split(':')
+            if len(parts) >= 3:
+                phone = parts[0].strip()
+                try:
+                    api_id = int(parts[1].strip())
+                    api_hash = parts[2].strip()
+                    session_file = f"session_{phone.replace('+', '')}.session"
+                    if add_number_to_pool(phone, api_id, api_hash, session_file):
+                        added += 1
+                    else:
+                        failed += 1
+                except:
+                    failed += 1
+            else:
+                failed += 1
+        
         context.user_data["waiting_for_numbers_bulk"] = False
-        await update.message.reply_text(
-            f"✅ **Numbers added!**\n\n"
-            f"➕ Added: {added}\n"
-            f"❌ Failed (duplicates): {failed}\n"
-            f"📊 Total in pool: {count_total_numbers()}\n"
-            f"🟢 Available: {count_available_numbers()}"
-        )
+        await update.message.reply_text(f"✅ **Added!**\n➕ {added}\n❌ {failed}\n📊 Total: {count_total_numbers()}\n🟢 Available: {count_available_numbers()}\n\n🔄 Restarting clients...")
+        await stop_all_number_clients()
+        asyncio.create_task(start_all_number_clients())
         return
     
-    # ===== ADMIN: ADD NUMBER PACKAGE =====
+    # ADMIN: ADD NUMBER PACKAGE
     if context.user_data.get("waiting_for_num_name") and user.id in ADMIN_IDS:
         name = update.message.text.strip()
         if name.isdigit():
-            await update.message.reply_text("❌ Please enter a **name** with letters, not just numbers!\n\nExample: `5 Random Numbers`\n\n❌ /cancel to cancel")
+            await update.message.reply_text("❌ Use letters.\nExample: `5 Numbers`\n\n❌ /cancel")
             return
         context.user_data["new_num_name"] = name
         context.user_data["waiting_for_num_name"] = False
         context.user_data["waiting_for_num_price"] = True
-        await update.message.reply_text("✏️ Enter price (in ₹):\n\nExample: `50`\n\n❌ /cancel to cancel")
+        await update.message.reply_text("✏️ Price in ₹:\nExample: `50`\n\n❌ /cancel")
         return
     
     if context.user_data.get("waiting_for_num_price") and user.id in ADMIN_IDS:
         try:
             price = int(update.message.text.strip())
             if price <= 0:
-                await update.message.reply_text("❌ Price must be greater than 0!\n\n❌ /cancel to cancel")
-                return
+                await update.message.reply_text("❌ Must be > 0!\n\n❌ /cancel"); return
             context.user_data["new_num_price"] = price
             context.user_data["waiting_for_num_price"] = False
             context.user_data["waiting_for_num_qty"] = True
-            await update.message.reply_text("✏️ Enter quantity (how many numbers?):\n\nExample: `5`\n\n❌ /cancel to cancel")
+            await update.message.reply_text("✏️ Quantity:\nExample: `5`\n\n❌ /cancel")
         except ValueError:
-            await update.message.reply_text("❌ Invalid price! Send a number like `50`.\n\n❌ /cancel to cancel")
+            await update.message.reply_text("❌ Invalid number.\n\n❌ /cancel")
         return
     
     if context.user_data.get("waiting_for_num_qty") and user.id in ADMIN_IDS:
         try:
             qty = int(update.message.text.strip())
             if qty <= 0:
-                await update.message.reply_text("❌ Quantity must be greater than 0!\n\n❌ /cancel to cancel")
-                return
+                await update.message.reply_text("❌ Must be > 0!\n\n❌ /cancel"); return
             name = context.user_data.get("new_num_name", "Package")
             price = context.user_data.get("new_num_price", 0)
             add_product("number", name, price, qty)
             context.user_data["waiting_for_num_qty"] = False
-            await update.message.reply_text(f"✅ **Number package added!**\n\n📱 {name}\n💰 ₹{price}\n📦 Qty: {qty}")
+            await update.message.reply_text(f"✅ **Added!**\n📱 {name}\n💰 ₹{price}\n📦 Qty: {qty}")
         except ValueError:
-            await update.message.reply_text("❌ Invalid quantity! Send a number like `5`.\n\n❌ /cancel to cancel")
+            await update.message.reply_text("❌ Invalid.\n\n❌ /cancel")
         return
     
-    # ===== ADMIN: ADD VIDEO PACKAGE =====
+    # ADMIN: VIDEO PACKAGE
     if context.user_data.get("waiting_for_vid_name") and user.id in ADMIN_IDS:
         name = update.message.text.strip()
         if name.isdigit():
-            await update.message.reply_text("❌ Please enter a **name** with letters, not just numbers!\n\nExample: `Premium Video Pack`\n\n❌ /cancel to cancel")
-            return
+            await update.message.reply_text("❌ Use letters.\nExample: `Premium Video`\n\n❌ /cancel"); return
         context.user_data["new_vid_name"] = name
         context.user_data["waiting_for_vid_name"] = False
         context.user_data["waiting_for_vid_price"] = True
-        await update.message.reply_text("✏️ Enter price (in ₹):\n\nExample: `100`\n\n❌ /cancel to cancel")
+        await update.message.reply_text("✏️ Price in ₹:\nExample: `100`\n\n❌ /cancel")
         return
     
     if context.user_data.get("waiting_for_vid_price") and user.id in ADMIN_IDS:
         try:
             price = int(update.message.text.strip())
             if price <= 0:
-                await update.message.reply_text("❌ Price must be greater than 0!\n\n❌ /cancel to cancel")
-                return
+                await update.message.reply_text("❌ Must be > 0!\n\n❌ /cancel"); return
             context.user_data["new_vid_price"] = price
             context.user_data["waiting_for_vid_price"] = False
             context.user_data["waiting_for_vid_link"] = True
-            await update.message.reply_text("✏️ Enter delivery link:\n\nExample: `https://t.me/yourchannel/123`\n\n❌ /cancel to cancel")
+            await update.message.reply_text("✏️ Delivery link:\nExample: `https://t.me/...`\n\n❌ /cancel")
         except ValueError:
-            await update.message.reply_text("❌ Invalid price! Send a number like `100`.\n\n❌ /cancel to cancel")
+            await update.message.reply_text("❌ Invalid.\n\n❌ /cancel")
         return
     
     if context.user_data.get("waiting_for_vid_link") and user.id in ADMIN_IDS:
         link = update.message.text.strip()
-        if not link.startswith("http") and not link.startswith("https://t.me"):
-            await update.message.reply_text("❌ Please enter a valid link starting with `https://`\n\n❌ /cancel to cancel")
-            return
+        if not link.startswith("http"):
+            await update.message.reply_text("❌ Must start with `https://`\n\n❌ /cancel"); return
         name = context.user_data.get("new_vid_name", "Video Pack")
         price = context.user_data.get("new_vid_price", 0)
         add_product("video", name, price, link)
         context.user_data["waiting_for_vid_link"] = False
-        await update.message.reply_text(f"✅ **Video package added!**\n\n🎬 {name}\n💰 ₹{price}\n🔗 {link}")
+        await update.message.reply_text(f"✅ **Added!**\n🎬 {name}\n💰 ₹{price}")
         return
     
-    # ===== ADMIN: SET UPI ID =====
+    # ADMIN: SETTINGS
     if context.user_data.get("waiting_for_upi") and user.id in ADMIN_IDS:
         new_upi = update.message.text.strip()
         if "@" not in new_upi:
-            await update.message.reply_text("❌ Invalid UPI ID. Must contain '@'.\n\nExample: `yourupi@paytm`\n\n❌ /cancel to cancel")
-            return
+            await update.message.reply_text("❌ Must contain '@'.\nExample: `upi@paytm`\n\n❌ /cancel"); return
         update_setting("upi_id", new_upi)
         context.user_data["waiting_for_upi"] = False
-        await update.message.reply_text(f"✅ **UPI ID updated!**\n\nNew ID: `{new_upi}`")
+        await update.message.reply_text(f"✅ **UPI updated!**\n`{new_upi}`")
         return
     
-    # ===== ADMIN: SET QR CODE =====
     if context.user_data.get("waiting_for_qr") and user.id in ADMIN_IDS:
         if update.message.photo:
             update_setting("qr_code", update.message.photo[-1].file_id)
             context.user_data["waiting_for_qr"] = False
-            await update.message.reply_text("✅ **QR Code updated!**")
+            await update.message.reply_text("✅ **QR updated!**")
         else:
-            await update.message.reply_text("❌ Please send a **photo** (image), not a file.\n\n❌ /cancel to cancel")
+            await update.message.reply_text("❌ Send photo.\n\n❌ /cancel")
         return
     
-    # ===== ADMIN: SET HOW TO VIDEO =====
     if context.user_data.get("waiting_for_howto") and user.id in ADMIN_IDS:
         if update.message.video:
             update_setting("how_to_use_video", update.message.video.file_id)
             context.user_data["waiting_for_howto"] = False
-            await update.message.reply_text("✅ **How-To video updated!**")
+            await update.message.reply_text("✅ **Video updated!**")
         else:
-            await update.message.reply_text("❌ Please send a **video** file.\n\n❌ /cancel to cancel")
+            await update.message.reply_text("❌ Send video.\n\n❌ /cancel")
         return
     
-    # ===== USER: PAYMENT SCREENSHOT =====
+    # USER: PAYMENT SCREENSHOT
     if context.user_data.get("waiting_for_screenshot"):
         if not update.message.photo:
-            await update.message.reply_text("📸 Please send a **screenshot image** (photo).")
+            await update.message.reply_text("📸 Send screenshot image.")
             return
         pending = get_pending_order_by_user(user.id)
         if pending:
-            await update.message.reply_text("⏳ Your payment is already under review.\n\nPlease wait for verification.")
+            await update.message.reply_text("⏳ Already under review.")
             return
         photo = update.message.photo[-1]
         pkg_id = context.user_data.get("pending_pkg_id")
         p_type = context.user_data.get("pending_type", "number")
         product = get_product(pkg_id) if pkg_id else None
         if not product:
-            await update.message.reply_text("❌ Package not found. Please start again with /start")
-            return
+            await update.message.reply_text("❌ Package not found. /start"); return
         order_id = create_order(user.id, user.first_name, user.username, p_type, pkg_id, product['name'], 
                                 product['price'], product.get('quantity', 1), product.get('delivery_link', ''), photo.file_id)
         context.user_data["waiting_for_screenshot"] = False
         context.user_data["pending_pkg_id"] = None
         context.user_data["pending_type"] = None
-        await update.message.reply_text("✅ **Payment screenshot received!**\n\n⏳ Please wait 5–30 minutes while we verify your payment.")
+        await update.message.reply_text("✅ **Received!**\n⏳ Wait 5-30 min.")
         await notify_admins(context, user, product, photo.file_id, p_type, order_id)
         return
 
 async def notify_admins(context, user, product, screenshot_id, p_type, order_id):
     pkg_emoji = "📱" if p_type == "number" else "🎬"
-    text = (
-        f"\n{pkg_emoji} **New Order Received!**\n\n"
-        f"👤 Name: {user.first_name}\n"
-        f"🆔 User ID: {user.id}\n"
-        f"📛 Username: @{user.username if user.username else 'N/A'}\n\n"
-        f"📦 Package: {product['name']}\n"
-        f"💰 Price: ₹{product['price']}\n"
-    )
+    text = f"\n{pkg_emoji} **New Order!**\n\n👤 {user.first_name}\n🆔 {user.id}\n📛 @{user.username or 'N/A'}\n\n📦 {product['name']}\n💰 ₹{product['price']}"
     keyboard = [
         [InlineKeyboardButton("✅ APPROVE", callback_data=f"approve_{order_id}"), 
          InlineKeyboardButton("❌ REJECT", callback_data=f"reject_{order_id}")],
@@ -840,86 +1143,69 @@ async def notify_admins(context, user, product, screenshot_id, p_type, order_id)
     ]
     for admin_id in ADMIN_IDS:
         try:
-            await context.bot.send_photo(chat_id=admin_id, photo=screenshot_id, caption=text, 
-                                         reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-        except Exception as e:
-            logger.error(f"Could not notify admin {admin_id}: {e}")
+            await context.bot.send_photo(chat_id=admin_id, photo=screenshot_id, caption=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        except:
+            pass
 
 async def approve_order(query, context, order_id):
     order = get_order(order_id)
     if not order:
-        await safe_edit(query, "❌ Order not found.")
-        return
+        await safe_edit(query, "❌ Not found."); return
     update_order_status(order_id, "approved")
     user_id = order["user_id"]
     
     if order["type"] == "number":
-        quantity = order.get("quantity", 1)
-        
-        available = get_available_numbers(quantity)
-        
-        if len(available) < quantity:
+        qty = order.get("quantity", 1)
+        available = get_available_numbers(qty)
+        if len(available) < qty:
             try:
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text="❌ **Sorry, not enough numbers available right now.**\n\n⏳ Please contact support. Your order has been noted and we will assign numbers shortly."
-                )
-            except Exception as e:
-                logger.error(f"Could not send message to user {user_id}: {e}")
-            await safe_edit_caption(query, caption=f"⚠️ **Not enough numbers in pool!**\nOrder #{order_id}\nNeeded: {quantity}, Available: {len(available)}")
+                await context.bot.send_message(chat_id=user_id, text="❌ **Not enough numbers.** Contact support.")
+            except:
+                pass
+            await safe_edit_caption(query, caption=f"⚠️ Need {qty}, have {len(available)}")
             return
         
-        text = "✅ **Payment Approved!**\n\n📱 **Your Numbers:**\n\n"
+        text = "✅ **Approved!**\n\n📱 **Your Number(s):**\n\n"
         assigned_list = []
-        for i in range(quantity):
+        for i in range(qty):
             num = available[i]
             assign_number_to_user(num["id"], user_id)
             assigned_list.append(num["number"])
             text += f"{i+1}. `{num['number']}`\n"
         
-        text += "\n🔐 **How it works:**\n"
-        text += "• These numbers are now assigned to you\n"
-        text += "• Go to any app and use one of these numbers\n"
-        text += "• When an OTP arrives on Telegram, I will forward it here **instantly**! ⚡\n"
-        text += "• Just wait... the OTP will come automatically 🤖\n\n"
-        text += "❤️ Thank you!\nKeep 2-Step Verification ON. 🔒"
+        text += "\n🔐 **How it works:**\n• This number is ONLY yours\n• Use on any app\n• OTP comes here automatically ⚡\n• When login code arrives, we'll send it to you, then auto-logout for security\n\n❤️ Thank you! 🔒"
         
         try:
             await context.bot.send_message(chat_id=user_id, text=text, parse_mode='Markdown')
-        except Exception as e:
-            logger.error(f"Could not send approval to user {user_id}: {e}")
+        except:
+            pass
         
-        await safe_edit_caption(query, caption=f"✅ **Order Approved!**\n\n{order['package_name']}\n₹{order['price']}\nUser: {order['first_name']}\n\n📱 Numbers assigned:\n" + "\n".join([f"`{n}`" for n in assigned_list]))
-        
+        await safe_edit_caption(query, caption=f"✅ **Approved!**\n{order['package_name']}\n₹{order['price']}\nUser: {order['first_name']}\n📱 " + ", ".join(assigned_list))
     elif order["type"] == "video":
         try:
-            await context.bot.send_message(chat_id=user_id, parse_mode='Markdown',
-                                           text=f"✅ **Payment Approved!**\n\n🔗 **Access Link:**\n\n{order.get('delivery_link', '')}")
-        except Exception as e:
-            logger.error(f"Could not send approval to user {user_id}: {e}")
-        await safe_edit_caption(query, caption=f"✅ **Order Approved!**\n\n{order['package_name']}\n₹{order['price']}\nUser: {order['first_name']}")
+            await context.bot.send_message(chat_id=user_id, parse_mode='Markdown', text=f"✅ **Approved!**\n\n🔗 {order.get('delivery_link', '')}")
+        except:
+            pass
+        await safe_edit_caption(query, caption=f"✅ **Approved!**\n{order['package_name']}\nUser: {order['first_name']}")
 
 async def reject_order(query, context, order_id):
     order = get_order(order_id)
     if not order:
-        await safe_edit(query, "❌ Order not found.")
-        return
+        await safe_edit(query, "❌ Not found."); return
     update_order_status(order_id, "rejected")
     try:
-        await context.bot.send_message(chat_id=order["user_id"], 
-                                       text="❌ **Payment Rejected.**\nContact support for details.")
-    except Exception as e:
-        logger.error(f"Could not notify user: {e}")
+        await context.bot.send_message(chat_id=order["user_id"], text="❌ **Rejected.** Contact support.")
+    except:
+        pass
     await safe_edit_caption(query, caption=f"❌ **Rejected!**\n{order['package_name']}\nUser: {order['first_name']}")
 
 async def block_user_from_order(query, context, order_id):
     order = get_order(order_id)
     if not order:
-        await safe_edit(query, "❌ Order not found.")
-        return
+        await safe_edit(query, "❌ Not found."); return
     block_user(order["user_id"], order["first_name"], order.get("username", ""))
     update_order_status(order_id, "blocked")
-    await safe_edit_caption(query, caption=f"🚫 **Blocked!**\n{order['first_name']} (ID: {order['user_id']})")
+    await safe_edit_caption(query, caption=f"🚫 **Blocked!**\n{order['first_name']}")
 
 async def back_to_main(query, context):
     keyboard = [
@@ -929,499 +1215,201 @@ async def back_to_main(query, context):
     ]
     if query.from_user.id in ADMIN_IDS:
         keyboard.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin_panel")])
-    
-    try:
-        await query.message.delete()
-    except:
-        pass
-    
-    welcome_text = (
-        "👋 **Welcome back!**\n\n"
-        "📱 Buy virtual numbers\n"
-        "🎬 Buy premium videos\n"
-        "📖 Learn how to use\n\n"
-        "Select an option below:"
-    )
-    await context.bot.send_message(
-        chat_id=query.message.chat_id,
-        text=welcome_text,
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    try: await query.message.delete()
+    except: pass
+    await context.bot.send_message(chat_id=query.message.chat_id, text="👋 **Welcome back!**", reply_markup=InlineKeyboardMarkup(keyboard))
 
-# ===== SHOW MY ASSIGNED NUMBERS (For Admin to check) =====
-async def show_my_assigned_numbers(query, context):
-    """Admin can see which numbers are assigned to which user"""
-    if query.from_user.id not in ADMIN_IDS:
-        return
+# ===================== ADMIN UI =====================
+async def show_invalid_numbers(query, context):
+    if query.from_user.id not in ADMIN_IDS: return
     with _db_lock:
-        conn = get_db()
-        c = conn.cursor()
-        c.execute('''
-            SELECT np.id, np.number, np.assigned_to, np.assigned_at, u.first_name, u.username 
-            FROM number_pool np 
-            LEFT JOIN users u ON np.assigned_to = u.user_id 
-            WHERE np.status = 'assigned' 
-            ORDER BY np.assigned_at DESC LIMIT 20
-        ''')
-        rows = c.fetchall()
-        conn.close()
+        conn = get_db(); c = conn.cursor()
+        c.execute("SELECT * FROM number_pool WHERE login_valid = 0 ORDER BY id DESC")
+        rows = [dict(r) for r in c.fetchall()]; conn.close()
+    text = "🚫 **Invalid Numbers**\n\n"
+    if not rows: text += "None."
+    else:
+        for r in rows:
+            u = f" (was: {r['assigned_to']})" if r['assigned_to'] else ""
+            text += f"• `{r['number']}`{u}\n"
+    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
+
+async def show_number_pool_admin(query, context):
+    if query.from_user.id not in ADMIN_IDS: return
+    text = f"📱 **Number Pool**\n\n📊 Total: {count_total_numbers()}\n🟢 Available: {count_available_numbers()}\n🔴 Assigned: {count_assigned_numbers()}\n🚫 Invalid: {count_invalid_numbers()}\n\n"
+    nums = get_available_numbers(15)
+    if nums:
+        text += "**Available:**\n"
+        for n in nums[:10]:
+            text += f"🆔 #{n['id']} • `{n['number']}`\n"
+        if len(nums) > 10: text += f"... +{len(nums)-10} more\n"
+    else:
+        text += "❌ No available numbers.\n"
     
-    text = "🔐 **Assigned Numbers**\n\n"
-    if not rows:
-        text += "No numbers assigned yet."
+    keyboard = [[InlineKeyboardButton("➕ Add Number", callback_data="admin_add_numbers")]]
+    if count_assigned_numbers() > 0:
+        keyboard.append([InlineKeyboardButton("🔐 Assigned", callback_data="admin_assigned_numbers")])
+    if count_invalid_numbers() > 0:
+        keyboard.append([InlineKeyboardButton("🚫 Invalid", callback_data="admin_invalid_numbers")])
+    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="admin_panel")])
+    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def show_assigned_numbers(query, context):
+    if query.from_user.id not in ADMIN_IDS: return
+    with _db_lock:
+        conn = get_db(); c = conn.cursor()
+        c.execute('''SELECT np.id, np.number, np.assigned_to, np.assigned_at, u.first_name, u.username FROM number_pool np LEFT JOIN users u ON np.assigned_to = u.user_id WHERE np.status = 'assigned' ORDER BY np.assigned_at DESC LIMIT 20''')
+        rows = [dict(r) for r in c.fetchall()]; conn.close()
+    text = "🔐 **Assigned**\n\n"
+    if not rows: text += "None."
     else:
         for r in rows:
             text += f"📱 `{r['number']}`\n  👤 {r['first_name']} (@{r['username'] or 'N/A'})\n  🆔 {r['assigned_to']}\n  🕐 {r['assigned_at'][:19]}\n\n"
-    
-    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]]))
+    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
 
-# ===================== NUMBER POOL ADMIN UI =====================
-async def show_number_pool_admin(query, context):
-    if query.from_user.id not in ADMIN_IDS:
-        return
-    
-    total = count_total_numbers()
-    available = count_available_numbers()
-    assigned = count_assigned_numbers()
-    
-    text = (
-        f"📱 **Number Pool Management**\n\n"
-        f"📊 Total: {total}\n"
-        f"🟢 Available: {available}\n"
-        f"🔴 Assigned: {assigned}\n\n"
-    )
-    
-    nums = get_available_numbers(15)
-    if nums:
-        text += "**Available Numbers:**\n"
-        for n in nums[:10]:
-            text += f"🆔 #{n['id']} • `{n['number']}`\n"
-        if len(nums) > 10:
-            text += f"... and {len(nums) - 10} more\n"
-    else:
-        text += "❌ No numbers in pool.\n"
-    
-    keyboard = [
-        [InlineKeyboardButton("➕ Add Numbers", callback_data="admin_add_numbers")],
-        [InlineKeyboardButton("🔐 Assigned Numbers", callback_data="admin_my_numbers")],
-        [InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]
-    ]
-    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
-
-# ===================== ADMIN PANEL =====================
 async def show_admin_panel(query, context):
-    if query.from_user.id not in ADMIN_IDS:
-        return
+    if query.from_user.id not in ADMIN_IDS: return
     keyboard = [
-        [InlineKeyboardButton("📱 Number Products", callback_data="admin_numbers"), 
-         InlineKeyboardButton("🎬 Video Products", callback_data="admin_videos")],
-        [InlineKeyboardButton("📱 Number Pool", callback_data="admin_number_pool"), 
-         InlineKeyboardButton("🔐 Assigned Nums", callback_data="admin_my_numbers")],
-        [InlineKeyboardButton("💳 Payment Settings", callback_data="admin_payment"), 
-         InlineKeyboardButton("📷 QR Code", callback_data="admin_qr")],
-        [InlineKeyboardButton("📖 HowTo Video", callback_data="admin_howto")],
-        [InlineKeyboardButton("📦 Pending Orders", callback_data="admin_pending"), 
-         InlineKeyboardButton("✅ Approved", callback_data="admin_approved")],
-        [InlineKeyboardButton("❌ Rejected", callback_data="admin_rejected"), 
-         InlineKeyboardButton("🚫 Blocked Users", callback_data="admin_blocked")],
-        [InlineKeyboardButton("👥 Users", callback_data="admin_users"), 
-         InlineKeyboardButton("📊 Statistics", callback_data="admin_stats")],
+        [InlineKeyboardButton("📱 Number Products", callback_data="admin_numbers"), InlineKeyboardButton("🎬 Video Products", callback_data="admin_videos")],
+        [InlineKeyboardButton("📱 Number Pool", callback_data="admin_number_pool"), InlineKeyboardButton("🔐 Assigned", callback_data="admin_assigned_numbers")],
+        [InlineKeyboardButton("🚫 Invalid", callback_data="admin_invalid_numbers")],
+        [InlineKeyboardButton("💳 Payment", callback_data="admin_payment"), InlineKeyboardButton("📷 QR", callback_data="admin_qr")],
+        [InlineKeyboardButton("📖 HowTo", callback_data="admin_howto")],
+        [InlineKeyboardButton("📦 Pending", callback_data="admin_pending"), InlineKeyboardButton("✅ Approved", callback_data="admin_approved")],
+        [InlineKeyboardButton("❌ Rejected", callback_data="admin_rejected"), InlineKeyboardButton("🚫 Blocked", callback_data="admin_blocked")],
+        [InlineKeyboardButton("👥 Users", callback_data="admin_users"), InlineKeyboardButton("📊 Stats", callback_data="admin_stats")],
         [InlineKeyboardButton("🔙 Back", callback_data="back_main")]
     ]
-    await safe_edit(query, "⚙️ **Admin Panel**\n\nAll controls are here — no commands needed!", reply_markup=InlineKeyboardMarkup(keyboard))
+    await safe_edit(query, "⚙️ **Admin Panel**", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def admin_number_products(query, context):
-    if query.from_user.id not in ADMIN_IDS:
-        return
+    if query.from_user.id not in ADMIN_IDS: return
     products = get_products("number")
     text = "📱 **Number Packages**\n\n"
-    if not products:
-        text += "No packages yet.\n"
+    if not products: text += "None."
     else:
         for p in products:
-            text += f"• **ID {p['id']}**: {p['name']}\n  💰 ₹{p['price']} | 📦 {p.get('quantity', 1)} numbers\n"
-    
-    keyboard = []
-    row = []
+            text += f"• **#{p['id']}**: {p['name']}\n  ₹{p['price']} | {p.get('quantity',1)} nums\n"
+    keyboard = []; row = []
     for p in products:
         row.append(InlineKeyboardButton(f"🗑️ #{p['id']}", callback_data=f"del_product_{p['id']}"))
-        if len(row) == 2:
-            keyboard.append(row)
-            row = []
-    if row:
-        keyboard.append(row)
-    keyboard.append([InlineKeyboardButton("➕ Add Number Package", callback_data="add_num_start")])
-    keyboard.append([InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")])
+        if len(row) == 2: keyboard.append(row); row = []
+    if row: keyboard.append(row)
+    keyboard.append([InlineKeyboardButton("➕ Add", callback_data="add_num_start")])
+    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="admin_panel")])
     await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def admin_video_products(query, context):
-    if query.from_user.id not in ADMIN_IDS:
-        return
+    if query.from_user.id not in ADMIN_IDS: return
     products = get_products("video")
     text = "🎬 **Video Packages**\n\n"
-    if not products:
-        text += "No packages yet.\n"
+    if not products: text += "None."
     else:
         for p in products:
-            text += f"• **ID {p['id']}**: {p['name']}\n  💰 ₹{p['price']} | 🔗 {p.get('delivery_link', 'N/A')}\n"
-    
-    keyboard = []
-    row = []
+            text += f"• **#{p['id']}**: {p['name']}\n  ₹{p['price']}\n"
+    keyboard = []; row = []
     for p in products:
         row.append(InlineKeyboardButton(f"🗑️ #{p['id']}", callback_data=f"del_product_{p['id']}"))
-        if len(row) == 2:
-            keyboard.append(row)
-            row = []
-    if row:
-        keyboard.append(row)
-    keyboard.append([InlineKeyboardButton("➕ Add Video Package", callback_data="add_vid_start")])
-    keyboard.append([InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")])
+        if len(row) == 2: keyboard.append(row); row = []
+    if row: keyboard.append(row)
+    keyboard.append([InlineKeyboardButton("➕ Add", callback_data="add_vid_start")])
+    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="admin_panel")])
     await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def show_admin_payment(query, context):
-    if query.from_user.id not in ADMIN_IDS:
-        return
-    current_upi = get_setting("upi_id") or "customupi@bank"
-    text = (
-        f"💳 **Payment Settings**\n\n"
-        f"🏦 Current UPI ID: `{current_upi}`\n\n"
-        f"Tap the button below to change your UPI ID."
-    )
-    keyboard = [
-        [InlineKeyboardButton("✏️ Change UPI ID", callback_data="edit_upi")],
-        [InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]
-    ]
-    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
+    if query.from_user.id not in ADMIN_IDS: return
+    upi = get_setting("upi_id") or "customupi@bank"
+    text = f"💳 **Payment**\n\n🏦 UPI: `{upi}`"
+    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✏️ Change", callback_data="edit_upi")], [InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
 
 async def show_admin_qr(query, context):
-    if query.from_user.id not in ADMIN_IDS:
-        return
+    if query.from_user.id not in ADMIN_IDS: return
     qr = get_setting("qr_code")
-    text = "📷 **QR Code Settings**\n\n"
-    text += "✅ QR Code is set.\n" if qr else "❌ No QR Code set.\n"
-    text += "\nTap the button to set a new QR code."
-    keyboard = [
-        [InlineKeyboardButton("✏️ Set QR Code", callback_data="edit_qr")],
-        [InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]
-    ]
-    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
+    text = "📷 **QR**\n\n" + ("✅ Set" if qr else "❌ Not set")
+    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✏️ Set", callback_data="edit_qr")], [InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
 
 async def show_admin_howto(query, context):
-    if query.from_user.id not in ADMIN_IDS:
-        return
+    if query.from_user.id not in ADMIN_IDS: return
     vid = get_setting("how_to_use_video")
-    text = "📖 **How To Use Video**\n\n"
-    text += "✅ Video is set.\n" if vid else "❌ No video set.\n"
-    text += "\nTap the button to set a new how-to video."
-    keyboard = [
-        [InlineKeyboardButton("✏️ Set Video", callback_data="edit_howto")],
-        [InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]
-    ]
-    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
+    text = "📖 **HowTo**\n\n" + ("✅ Set" if vid else "❌ Not set")
+    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✏️ Set", callback_data="edit_howto")], [InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
 
 async def show_admin_orders(query, context, status):
-    if query.from_user.id not in ADMIN_IDS:
-        return
+    if query.from_user.id not in ADMIN_IDS: return
     orders = get_orders_by_status(status)
     emoji = {"pending": "📦", "approved": "✅", "rejected": "❌"}.get(status, "📋")
-    text = f"{emoji} **{status.title()} Orders**\n\n"
-    if not orders:
-        text += "No orders found."
+    text = f"{emoji} **{status.title()}**\n\n"
+    if not orders: text += "None."
     else:
         for o in orders:
-            text += f"• {o['first_name']} - {o['package_name']} - ₹{o['price']}\n  🆔 ID: {o['id']} | 🕐 {o['created_at'][:19]}\n\n"
-    keyboard = [[InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]]
-    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
+            text += f"• {o['first_name']} - {o['package_name']} - ₹{o['price']}\n  🆔 {o['id']} | {o['created_at'][:19]}\n\n"
+    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
 
 async def show_blocked_users(query, context):
-    if query.from_user.id not in ADMIN_IDS:
-        return
+    if query.from_user.id not in ADMIN_IDS: return
     blocked = get_blocked_users()
-    text = "🚫 **Blocked Users**\n\n"
+    text = "🚫 **Blocked**\n\n"
     if not blocked:
-        text += "No blocked users."
-        await safe_edit(query, text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]]))
+        text += "None."
+        await safe_edit(query, text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
         return
-    keyboard = []
-    row = []
+    keyboard = []; row = []
     for b in blocked:
         row.append(InlineKeyboardButton(f"🔓 {b['first_name']}", callback_data=f"unblock_{b['id']}"))
-        if len(row) == 2:
-            keyboard.append(row)
-            row = []
-    if row:
-        keyboard.append(row)
-    keyboard.append([InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")])
+        if len(row) == 2: keyboard.append(row); row = []
+    if row: keyboard.append(row)
+    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="admin_panel")])
     for b in blocked:
-        text += f"• {b['first_name']} (@{b.get('username', 'N/A')}) - ID: {b['user_id']}\n"
+        text += f"• {b['first_name']} (@{b.get('username','N/A')}) - {b['user_id']}\n"
     await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def show_users(query, context):
-    if query.from_user.id not in ADMIN_IDS:
-        return
-    text = f"👥 **Total Users:** {count_users()}\n\n**Recent Users:**\n"
+    if query.from_user.id not in ADMIN_IDS: return
+    text = f"👥 **Users:** {count_users()}\n\n**Recent:**\n"
     for u in get_recent_users(10):
-        text += f"• {u['first_name']} (@{u.get('username', 'N/A')})\n"
-    keyboard = [[InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]]
-    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
+        text += f"• {u['first_name']} (@{u.get('username','N/A')})\n"
+    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
 
 async def show_stats(query, context):
-    if query.from_user.id not in ADMIN_IDS:
-        return
+    if query.from_user.id not in ADMIN_IDS: return
     text = (
-        f"📊 **Bot Statistics**\n\n"
-        f"📱 Number Packages: {count_products('number')}\n"
-        f"🎬 Video Packages: {count_products('video')}\n"
-        f"👥 Total Users: {count_users()}\n"
+        f"📊 **Stats**\n\n"
+        f"📱 Number Pkgs: {count_products('number')}\n"
+        f"🎬 Video Pkgs: {count_products('video')}\n"
+        f"👥 Users: {count_users()}\n"
         f"🚫 Blocked: {count_blocked()}\n"
-        f"📞 Numbers in Pool: {count_total_numbers()}\n"
+        f"📞 Pool: {count_total_numbers()}\n"
         f"🟢 Available: {count_available_numbers()}\n"
-        f"🔴 Assigned: {count_assigned_numbers()}\n\n"
-        f"📦 **Orders:**\n"
-        f"• Total: {count_orders()}\n"
-        f"• ⏳ Pending: {count_orders('pending')}\n"
-        f"• ✅ Approved: {count_orders('approved')}\n"
-        f"• ❌ Rejected: {count_orders('rejected')}\n"
+        f"🔴 Assigned: {count_assigned_numbers()}\n"
+        f"🚫 Invalid: {count_invalid_numbers()}\n"
+        f"Active Clients: {len(active_clients)}\n\n"
+        f"📦 Total: {count_orders()}\n"
+        f"⏳ Pending: {count_orders('pending')}\n"
+        f"✅ Approved: {count_orders('approved')}\n"
+        f"❌ Rejected: {count_orders('rejected')}\n"
     )
-    keyboard = [[InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]]
-    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
-
-# ===================== TELETHON OTP CATCHER =====================
-# This is the CRITICAL part - it listens for OTP messages on the user account
-
-otp_client = None  # Global Telethon client
-
-async def otp_message_handler(event):
-    """Called whenever the OTP catcher account receives a new message"""
-    global otp_client
-    
-    try:
-        sender = await event.get_sender()
-        chat = await event.get_chat()
-        message_text = event.raw_text
-        
-        if not message_text:
-            return
-        
-        sender_name = sender.first_name if sender else "Unknown"
-        chat_id = event.chat_id
-        sender_id = event.sender_id
-        
-        logger.info(f"📩 New message from {sender_name} (chat: {chat_id}): {message_text[:50]}...")
-        
-        # Check if this message is from a number that's in our pool
-        # We check the sender name or phone number
-        sender_phone = None
-        try:
-            if hasattr(sender, 'phone'):
-                sender_phone = sender.phone
-        except:
-            pass
-        
-        # Check by chat_id first (if we stored it)
-        with _db_lock:
-            conn = get_db()
-            c = conn.cursor()
-            
-            # Try to find by chat_id first
-            c.execute("SELECT * FROM number_pool WHERE chat_id = ? AND status = 'assigned'", (chat_id,))
-            row = c.fetchone()
-            
-            if not row and sender_phone:
-                # Try by phone number
-                c.execute("SELECT * FROM number_pool WHERE number LIKE ? AND status = 'assigned'", (f"%{sender_phone[-10:]}%",))
-                row = c.fetchone()
-            
-            conn.close()
-        
-        if not row:
-            # Also check if message text contains a number from our pool
-            # This is a fallback for when Telegram doesn't expose the phone
-            with _db_lock:
-                conn = get_db()
-                c = conn.cursor()
-                c.execute("SELECT * FROM number_pool WHERE status = 'assigned'")
-                all_assigned = [dict(r) for r in c.fetchall()]
-                conn.close()
-            
-            found = False
-            for num in all_assigned:
-                num_clean = num['number'].replace("+", "").replace(" ", "")
-                if num_clean in message_text or message_text in num_clean:
-                    row = num
-                    found = True
-                    break
-            
-            if not found:
-                return  # Not for any of our numbers
-        
-        # We found it! This is an OTP for a user
-        user_id = row['assigned_to']
-        number = row['number']
-        
-        # Extract OTP from message
-        otp_match = re.search(r'(\d{4,8})', message_text)
-        otp_code = otp_match.group(1) if otp_match else message_text
-        
-        # Save to database
-        otp_id = save_otp_record(number, user_id, message_text, sender_name)
-        
-        # Forward to user via bot
-        from telegram import Bot
-        bot = Bot(token=BOT_TOKEN)
-        
-        forward_text = (
-            f"🔐 **OTP Received!** 📩\n\n"
-            f"📱 **Number:** `{number}`\n"
-            f"🔑 **OTP:** `{otp_code}`\n"
-            f"👤 **From:** {sender_name}\n"
-            f"📨 **Full Message:**\n`{message_text}`\n\n"
-            f"⚡ Use the OTP quickly before it expires!"
-        )
-        
-        try:
-            await bot.send_message(chat_id=user_id, text=forward_text, parse_mode='Markdown')
-            mark_otp_forwarded(otp_id)
-            logger.info(f"✅ OTP forwarded to user {user_id} for number {number}")
-        except Exception as e:
-            logger.error(f"❌ Failed to forward OTP to user {user_id}: {e}")
-        
-        # Also notify admins
-        for admin_id in ADMIN_IDS:
-            try:
-                await bot.send_message(
-                    chat_id=admin_id,
-                    text=f"🔄 **OTP Forwarded!**\n\n📱 {number}\n🔑 `{otp_code}`\n👤 User: `{user_id}`",
-                    parse_mode='Markdown'
-                )
-            except:
-                pass
-                
-    except Exception as e:
-        logger.error(f"Error in OTP handler: {e}")
-
-async def start_otp_catcher():
-    """Start the Telethon client to catch OTP messages"""
-    global otp_client
-    
-    logger.info("Starting OTP Catcher (Telethon)...")
-    
-    otp_client = TelegramClient('otp_catcher_session', API_ID, API_HASH)
-    
-    await otp_client.start(phone=PHONE_NUMBER)
-    
-    logger.info(f"✅ OTP Catcher logged in as: {await otp_client.get_me()}")
-    
-    # Register the message handler
-    @otp_client.on(events.NewMessage)
-    async def handler(event):
-        await otp_message_handler(event)
-    
-    logger.info("👂 OTP Catcher is now listening for messages...")
-    
-    # Keep running
-    await otp_client.run_until_disconnected()
+    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
 
 # ===================== HEALTH SERVER =====================
-
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
         self.end_headers()
         self.wfile.write(b"OK")
-    def log_message(self, format, *args):
-        pass
+    def log_message(self, format, *args): pass
 
 def run_health_server():
     server = HTTPServer(('0.0.0.0', PORT), HealthHandler)
-    logger.info(f"Health server running on port {PORT}")
+    logger.info(f"Health server on port {PORT}")
     server.serve_forever()
 
 # ===================== MAIN =====================
-
 _shutdown = False
 
 def signal_handler(sig, frame):
     global _shutdown
     _shutdown = True
-    logger.info("Shutdown signal received, stopping bot...")
+    logger.info("Shutdown signal received")
 
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if isinstance(context.error, Conflict):
-        logger.warning(f"Conflict error caught (another instance may be running): {context.error}")
-        return
-    logger.error(f"Update {update} caused error {context.error}")
-
-async def run_bot():
-    """Async function to run the bot"""
-    global _shutdown
-    
-    init_db()
-    logger.info("Database initialized")
-    
-    # Start OTP Catcher in background
-    otp_task = asyncio.create_task(start_otp_catcher())
-    
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_error_handler(error_handler)
-    
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(button_callback))
-    app.add_handler(MessageHandler(filters.ALL, handle_messages))
-    
-    logger.info("Bot started successfully!")
-    
-    await app.initialize()
-    
-    try:
-        await app.bot.delete_webhook(drop_pending_updates=True)
-        logger.info("Webhook deleted successfully")
-    except Exception as e:
-        logger.warning(f"Could not delete webhook: {e}")
-    
-    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-    await app.start()
-    
-    logger.info("Bot is now polling for updates...")
-    
-    try:
-        while not _shutdown:
-            await asyncio.sleep(1)
-    except asyncio.CancelledError:
-        pass
-    finally:
-        logger.info("Shutting down bot...")
-        otp_task.cancel()
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
-        logger.info("Bot shutdown complete.")
-
-def main():
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
-    try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(run_bot())
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
-    except Exception as e:
-        logger.error(f"Unexpected error: {e}")
-    finally:
-        try:
-            pending = asyncio.all_tasks(loop)
-            for task in pending:
-                task.cancel()
-            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-            loop.close()
-        except:
-            pass
-        logger.info("Main thread exiting.")
-
-if __name__ == "__main__":
-    health_thread = threading.Thread(target=run_health_server, daemon=True)
-    health_thread.start()
-    main()
+async def error_handler(update: Update, context: ContextTypes.DEFAULT
