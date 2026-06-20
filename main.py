@@ -3,6 +3,7 @@ import datetime
 import logging
 import os
 import threading
+import random
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
@@ -278,7 +279,7 @@ async def safe_edit(query, text, reply_markup=None):
         await query.edit_message_text(text, reply_markup=reply_markup)
     except Exception as e:
         if "Message is not modified" in str(e):
-            pass  # Ignore - message content is same
+            pass
         else:
             raise e
 
@@ -589,7 +590,6 @@ async def approve_order(query, context, order_id):
         quantity = order.get("quantity", 1)
         numbers_text = "✅ Payment Approved!\n\n📱 Your Numbers:\n\n"
         
-        import random
         for i in range(quantity):
             fake_number = f"+9112345{random.randint(10000, 99999)}"
             numbers_text += f"{i+1}. {fake_number}\n"
@@ -941,10 +941,9 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"OK")
     
     def log_message(self, format, *args):
-        pass  # Suppress health check logs
+        pass
 
 def run_health_server():
-    """অকারী HTTP সার্ভার যা Render-এর পোর্ট চেক পাস করবে"""
     server = HTTPServer(('0.0.0.0', PORT), HealthHandler)
     logger.info(f"Health server running on port {PORT}")
     server.serve_forever()
@@ -972,6 +971,5 @@ def main():
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    # Health server আলাদা থ্রেডে চালু করুন
     threading.Thread(target=run_health_server, daemon=True).start()
     main()
