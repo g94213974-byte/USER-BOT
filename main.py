@@ -4,7 +4,6 @@ import logging
 import os
 import threading
 import random
-import asyncio
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
@@ -31,7 +30,7 @@ _db_lock = threading.Lock()
 def get_db():
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")  # Better concurrent performance
+    conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
 def init_db():
@@ -247,7 +246,7 @@ def count_blocked():
         conn.close()
         return result
 
-# ===================== FIX: Safe edit =====================
+# ===================== SAFE EDIT =====================
 async def safe_edit(query, text, reply_markup=None):
     try:
         await query.edit_message_text(text, reply_markup=reply_markup)
@@ -262,7 +261,7 @@ async def safe_edit_caption(query, caption, reply_markup=None):
         if "Message is not modified" not in str(e):
             logger.error(f"safe_edit_caption error: {e}")
 
-# ===================== HANDLERS =====================
+# ===================== USER HANDLERS =====================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -359,6 +358,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_users(query, context)
     elif data == "admin_stats":
         await show_stats(query, context)
+    # ===== NEW: UPI ID edit from admin panel =====
+    elif data == "edit_upi":
+        if query.from_user.id in ADMIN_IDS:
+            context.user_data["waiting_for_upi"] = True
+            await safe_edit(query, "✏️ Please enter your new UPI ID:\n\nExample: `yourupi@paytm`\n\n❌ /cancel to cancel.", 
+                            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="admin_payment")]]))
 
 async def show_how_to_use(query, context):
     video_id = get_setting("how_to_use_video")
@@ -619,10 +624,21 @@ async def admin_video_products(query, context):
     await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def show_admin_payment(query, context):
+    """NEW: Payment settings with EDIT UPI button instead of /set_upi command"""
     if query.from_user.id not in ADMIN_IDS:
         return
-    await safe_edit(query, f"💳 Payment Settings\n\n🏦 UPI ID: {get_setting('upi_id') or 'customupi@bank'}\n\nTo change:\n/set_upi [new_upi_id]", 
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
+    current_upi = get_setting("upi_id") or "customupi@bank"
+    text = (
+        f"💳 Payment Settings\n\n"
+        f"🏦 Current UPI ID: `{current_upi}`\n\n"
+        f"Tap the button below to change your UPI ID.\n\n"
+        f"📷 To set QR Code: reply to a photo with /set_qr"
+    )
+    keyboard = [
+        [InlineKeyboardButton("✏️ Change UPI ID", callback_data="edit_upi")],
+        [InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]
+    ]
+    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def show_admin_qr(query, context):
     if query.from_user.id not in ADMIN_IDS:
@@ -702,6 +718,34 @@ async def show_stats(query, context):
     )
     await safe_edit(query, text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
 
+# ===================== MESSAGE HANDLER FOR UPI INPUT =====
+async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """NEW: Handle text input for UPI ID editing"""
+    user = update.effective_user
+    
+    # Handle cancel command
+    if update.message.text == "/cancel":
+        context.user_data["waiting_for_upi"] = False
+        await update.message.reply_text("❌ Cancelled.")
+        return
+    
+    # Handle UPI ID input
+    if context.user_data.get("waiting_for_upi"):
+        if user.id not in ADMIN_IDS:
+            return
+        new_upi = update.message.text.strip()
+        if "@" not in new_upi:
+            await update.message.reply_text("❌ Invalid UPI ID. Must contain '@'. Example: `yourupi@paytm`")
+            return
+        update_setting("upi_id", new_upi)
+        context.user_data["waiting_for_upi"] = False
+        await update.message.reply_text(f"✅ UPI ID updated to: `{new_upi}`")
+        return
+    
+    # If no waiting state, ignore text
+    if not context.user_data.get("waiting_for_screenshot"):
+        return
+
 # ===================== ADMIN COMMANDS =====================
 
 async def add_number_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -745,14 +789,7 @@ async def delete_product_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception as e:
         await update.message.reply_text(f"❌ Usage: /del_product [id]\nError: {e}")
 
-async def set_upi(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
-        return
-    if not context.args:
-        await update.message.reply_text("Usage: /set_upi [upi_id]")
-        return
-    update_setting("upi_id", " ".join(context.args))
-    await update.message.reply_text(f"✅ UPI ID updated!")
+# NOTE: /set_upi command is REMOVED - UPI is now set via Admin Panel > Payment > Change UPI ID
 
 async def set_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
@@ -808,33 +845,34 @@ def run_health_server():
 # ===================== MAIN =====================
 
 def main():
-    # Initialize database
     init_db()
     logger.info("Database initialized")
     
-    # Build application
     app = Application.builder().token(BOT_TOKEN).build()
     
-    # Register handlers
+    # Command handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("add_number", add_number_product))
     app.add_handler(CommandHandler("add_video", add_video_product))
     app.add_handler(CommandHandler("del_product", delete_product_cmd))
-    app.add_handler(CommandHandler("set_upi", set_upi))
+    # /set_upi is REMOVED - use Admin Panel > Payment > Change UPI ID instead
     app.add_handler(CommandHandler("set_qr", set_qr))
     app.add_handler(CommandHandler("set_howto", set_howto))
     app.add_handler(CommandHandler("pos_number", set_position))
     app.add_handler(CommandHandler("pos_video", set_position))
+    app.add_handler(CommandHandler("cancel", handle_text_message))
+    
+    # Callback handler
     app.add_handler(CallbackQueryHandler(button_callback))
+    
+    # Message handlers (order matters: text handler BEFORE photo handler)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
     app.add_handler(MessageHandler(filters.PHOTO, handle_screenshot))
     
     logger.info("Bot started successfully!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    # Start health server in a daemon thread
     health_thread = threading.Thread(target=run_health_server, daemon=True)
     health_thread.start()
-    
-    # Run the bot
     main()
