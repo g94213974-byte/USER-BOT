@@ -875,6 +875,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "admin_invalid_numbers":
         if query.from_user.id in ADMIN_IDS:
             await show_invalid_numbers(query, context)
+    elif data == "admin_assigned_numbers":
+        if query.from_user.id in ADMIN_IDS:
+            await show_assigned_numbers(query, context)
     elif data.startswith("del_pool_num_"):
         if query.from_user.id in ADMIN_IDS:
             num_id = int(data.replace("del_pool_num_", ""))
@@ -886,6 +889,26 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 conn.close()
             await safe_edit(query, "✅ Removed!")
             await show_number_pool_admin(query, context)
+    elif data == "add_num_start":
+        if query.from_user.id in ADMIN_IDS:
+            context.user_data["waiting_for_num_name"] = True
+            await safe_edit(query, "✏️ Package name:\nExample: `5 Numbers`\n\n❌ /cancel")
+    elif data == "add_vid_start":
+        if query.from_user.id in ADMIN_IDS:
+            context.user_data["waiting_for_vid_name"] = True
+            await safe_edit(query, "✏️ Package name:\nExample: `Premium Video`\n\n❌ /cancel")
+    elif data == "edit_upi":
+        if query.from_user.id in ADMIN_IDS:
+            context.user_data["waiting_for_upi"] = True
+            await safe_edit(query, "✏️ Send new UPI ID:\nExample: `yourupi@paytm`\n\n❌ /cancel")
+    elif data == "edit_qr":
+        if query.from_user.id in ADMIN_IDS:
+            context.user_data["waiting_for_qr"] = True
+            await safe_edit(query, "📷 Send QR image:\n\n❌ /cancel")
+    elif data == "edit_howto":
+        if query.from_user.id in ADMIN_IDS:
+            context.user_data["waiting_for_howto"] = True
+            await safe_edit(query, "🎬 Send how-to video:\n\n❌ /cancel")
 
 async def show_how_to_use(query, context):
     video_id = get_setting("how_to_use_video")
@@ -1377,39 +1400,3 @@ async def show_stats(query, context):
         f"📱 Number Pkgs: {count_products('number')}\n"
         f"🎬 Video Pkgs: {count_products('video')}\n"
         f"👥 Users: {count_users()}\n"
-        f"🚫 Blocked: {count_blocked()}\n"
-        f"📞 Pool: {count_total_numbers()}\n"
-        f"🟢 Available: {count_available_numbers()}\n"
-        f"🔴 Assigned: {count_assigned_numbers()}\n"
-        f"🚫 Invalid: {count_invalid_numbers()}\n"
-        f"Active Clients: {len(active_clients)}\n\n"
-        f"📦 Total: {count_orders()}\n"
-        f"⏳ Pending: {count_orders('pending')}\n"
-        f"✅ Approved: {count_orders('approved')}\n"
-        f"❌ Rejected: {count_orders('rejected')}\n"
-    )
-    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
-
-# ===================== HEALTH SERVER =====================
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"OK")
-    def log_message(self, format, *args): pass
-
-def run_health_server():
-    server = HTTPServer(('0.0.0.0', PORT), HealthHandler)
-    logger.info(f"Health server on port {PORT}")
-    server.serve_forever()
-
-# ===================== MAIN =====================
-_shutdown = False
-
-def signal_handler(sig, frame):
-    global _shutdown
-    _shutdown = True
-    logger.info("Shutdown signal received")
-
-async def error_handler(update: Update, context: ContextTypes.DEFAULT
