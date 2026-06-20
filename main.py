@@ -5,6 +5,7 @@ import os
 import threading
 import random
 import asyncio
+import signal
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
@@ -375,15 +376,15 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "add_num_start":
         if query.from_user.id in ADMIN_IDS:
             context.user_data["waiting_for_num_name"] = True
-            await safe_edit(query, "✏️ Enter number package name:\n\nExample: 5 Random Numbers\n\n❌ /cancel to cancel")
+            await safe_edit(query, "✏️ Enter number package **name**:\n\nExample: `5 Random Numbers`\n\n⚠️ Use letters only, not numbers!\n\n❌ /cancel to cancel")
     elif data == "add_vid_start":
         if query.from_user.id in ADMIN_IDS:
             context.user_data["waiting_for_vid_name"] = True
-            await safe_edit(query, "✏️ Enter video package name:\n\nExample: Premium Video Pack\n\n❌ /cancel to cancel")
+            await safe_edit(query, "✏️ Enter video package **name**:\n\nExample: `Premium Video Pack`\n\n⚠️ Use letters only, not numbers!\n\n❌ /cancel to cancel")
     elif data == "edit_upi":
         if query.from_user.id in ADMIN_IDS:
             context.user_data["waiting_for_upi"] = True
-            await safe_edit(query, "✏️ Send your new UPI ID:\n\nExample: yourupi@paytm\n\n❌ /cancel to cancel")
+            await safe_edit(query, "✏️ Send your new UPI ID:\n\nExample: `yourupi@paytm`\n\n❌ /cancel to cancel")
     elif data == "edit_qr":
         if query.from_user.id in ADMIN_IDS:
             context.user_data["waiting_for_qr"] = True
@@ -445,12 +446,15 @@ async def show_video_products(query, context):
     await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def show_payment(query, context, p_type, pkg_id):
+    """FIXED: Payment page with buttons that actually work"""
     product = get_product(pkg_id)
     if not product:
         await safe_edit(query, "❌ Package not found.")
         return
     upi_id = get_setting("upi_id") or "customupi@bank"
     qr_code = get_setting("qr_code")
+    
+    # Payment info as a new message with buttons
     payment_text = (
         f"💳 **Payment Details**\n\n"
         f"📦 Package: {product['name']}\n"
@@ -459,23 +463,45 @@ async def show_payment(query, context, p_type, pkg_id):
         f"📱 Pay using PhonePe / GPay / Paytm\n\n"
         f"⚠️ Pay the EXACT amount shown above"
     )
+    
     keyboard = [
         [InlineKeyboardButton("📸 I Have Paid", callback_data=f"pay_{p_type}_{pkg_id}")],
         [InlineKeyboardButton("🔙 Back", callback_data=f"back_{p_type}s")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    # Send QR + buttons as a new message
     if qr_code:
         try:
-            await context.bot.send_photo(chat_id=query.message.chat_id, photo=qr_code, 
-                                         caption=payment_text, reply_markup=reply_markup, parse_mode='Markdown')
+            # Delete old message
             try:
                 await query.message.delete()
             except:
                 pass
+            # Send new photo with buttons
+            await context.bot.send_photo(
+                chat_id=query.message.chat_id, 
+                photo=qr_code, 
+                caption=payment_text, 
+                reply_markup=reply_markup, 
+                parse_mode='Markdown'
+            )
             return
         except Exception as e:
             logger.error(f"Error sending QR: {e}")
-    await safe_edit(query, payment_text, reply_markup=reply_markup)
+    
+    # No QR - send text with buttons
+    # Delete old message first to avoid confusion
+    try:
+        await query.message.delete()
+    except:
+        pass
+    await context.bot.send_message(
+        chat_id=query.message.chat_id,
+        text=payment_text,
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
 
 # ===================== MESSAGE HANDLER =====
 async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -494,72 +520,94 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # ===== ADMIN: ADD NUMBER PACKAGE =====
     if context.user_data.get("waiting_for_num_name") and user.id in ADMIN_IDS:
-        context.user_data["new_num_name"] = update.message.text.strip()
+        name = update.message.text.strip()
+        # FIXED: Check if name contains only numbers
+        if name.isdigit():
+            await update.message.reply_text("❌ Please enter a **name** with letters, not just numbers!\n\nExample: `5 Random Numbers`\n\n❌ /cancel to cancel")
+            return
+        context.user_data["new_num_name"] = name
         context.user_data["waiting_for_num_name"] = False
         context.user_data["waiting_for_num_price"] = True
-        await update.message.reply_text("✏️ Enter price (in ₹):\n\nExample: 50\n\n❌ /cancel to cancel")
+        await update.message.reply_text("✏️ Enter price (in ₹):\n\nExample: `50`\n\n❌ /cancel to cancel")
         return
     
     if context.user_data.get("waiting_for_num_price") and user.id in ADMIN_IDS:
         try:
             price = int(update.message.text.strip())
+            if price <= 0:
+                await update.message.reply_text("❌ Price must be greater than 0!\n\n❌ /cancel to cancel")
+                return
             context.user_data["new_num_price"] = price
             context.user_data["waiting_for_num_price"] = False
             context.user_data["waiting_for_num_qty"] = True
-            await update.message.reply_text("✏️ Enter quantity (how many numbers?):\n\nExample: 5\n\n❌ /cancel to cancel")
-        except:
-            await update.message.reply_text("❌ Invalid price! Send a number.\n\n❌ /cancel to cancel")
+            await update.message.reply_text("✏️ Enter quantity (how many numbers?):\n\nExample: `5`\n\n❌ /cancel to cancel")
+        except ValueError:
+            await update.message.reply_text("❌ Invalid price! Send a number like `50`.\n\n❌ /cancel to cancel")
         return
     
     if context.user_data.get("waiting_for_num_qty") and user.id in ADMIN_IDS:
         try:
             qty = int(update.message.text.strip())
+            if qty <= 0:
+                await update.message.reply_text("❌ Quantity must be greater than 0!\n\n❌ /cancel to cancel")
+                return
             name = context.user_data.get("new_num_name", "Package")
             price = context.user_data.get("new_num_price", 0)
             add_product("number", name, price, qty)
             context.user_data["waiting_for_num_qty"] = False
-            await update.message.reply_text(f"✅ Number package added!\n\n📱 {name}\n💰 ₹{price}\n📦 Qty: {qty}")
-        except:
-            await update.message.reply_text("❌ Invalid quantity! Send a number.\n\n❌ /cancel to cancel")
+            await update.message.reply_text(f"✅ **Number package added!**\n\n📱 {name}\n💰 ₹{price}\n📦 Qty: {qty}")
+        except ValueError:
+            await update.message.reply_text("❌ Invalid quantity! Send a number like `5`.\n\n❌ /cancel to cancel")
         return
     
     # ===== ADMIN: ADD VIDEO PACKAGE =====
     if context.user_data.get("waiting_for_vid_name") and user.id in ADMIN_IDS:
-        context.user_data["new_vid_name"] = update.message.text.strip()
+        name = update.message.text.strip()
+        # FIXED: Check if name contains only numbers
+        if name.isdigit():
+            await update.message.reply_text("❌ Please enter a **name** with letters, not just numbers!\n\nExample: `Premium Video Pack`\n\n❌ /cancel to cancel")
+            return
+        context.user_data["new_vid_name"] = name
         context.user_data["waiting_for_vid_name"] = False
         context.user_data["waiting_for_vid_price"] = True
-        await update.message.reply_text("✏️ Enter price (in ₹):\n\nExample: 100\n\n❌ /cancel to cancel")
+        await update.message.reply_text("✏️ Enter price (in ₹):\n\nExample: `100`\n\n❌ /cancel to cancel")
         return
     
     if context.user_data.get("waiting_for_vid_price") and user.id in ADMIN_IDS:
         try:
             price = int(update.message.text.strip())
+            if price <= 0:
+                await update.message.reply_text("❌ Price must be greater than 0!\n\n❌ /cancel to cancel")
+                return
             context.user_data["new_vid_price"] = price
             context.user_data["waiting_for_vid_price"] = False
             context.user_data["waiting_for_vid_link"] = True
-            await update.message.reply_text("✏️ Enter delivery link:\n\nExample: https://t.me/yourchannel/123\n\n❌ /cancel to cancel")
-        except:
-            await update.message.reply_text("❌ Invalid price! Send a number.\n\n❌ /cancel to cancel")
+            await update.message.reply_text("✏️ Enter delivery link:\n\nExample: `https://t.me/yourchannel/123`\n\n❌ /cancel to cancel")
+        except ValueError:
+            await update.message.reply_text("❌ Invalid price! Send a number like `100`.\n\n❌ /cancel to cancel")
         return
     
     if context.user_data.get("waiting_for_vid_link") and user.id in ADMIN_IDS:
         link = update.message.text.strip()
+        if not link.startswith("http") and not link.startswith("t.me") and not link.startswith("https://t.me"):
+            await update.message.reply_text("❌ Please enter a valid link starting with `https://` or `t.me/`\n\n❌ /cancel to cancel")
+            return
         name = context.user_data.get("new_vid_name", "Video Pack")
         price = context.user_data.get("new_vid_price", 0)
         add_product("video", name, price, link)
         context.user_data["waiting_for_vid_link"] = False
-        await update.message.reply_text(f"✅ Video package added!\n\n🎬 {name}\n💰 ₹{price}\n🔗 {link}")
+        await update.message.reply_text(f"✅ **Video package added!**\n\n🎬 {name}\n💰 ₹{price}\n🔗 {link}")
         return
     
     # ===== ADMIN: SET UPI ID =====
     if context.user_data.get("waiting_for_upi") and user.id in ADMIN_IDS:
         new_upi = update.message.text.strip()
         if "@" not in new_upi:
-            await update.message.reply_text("❌ Invalid UPI ID. Must contain '@'.\n\n❌ /cancel to cancel")
+            await update.message.reply_text("❌ Invalid UPI ID. Must contain '@'.\n\nExample: `yourupi@paytm`\n\n❌ /cancel to cancel")
             return
         update_setting("upi_id", new_upi)
         context.user_data["waiting_for_upi"] = False
-        await update.message.reply_text(f"✅ UPI ID updated to: {new_upi}")
+        await update.message.reply_text(f"✅ **UPI ID updated!**\n\nNew ID: `{new_upi}`")
         return
     
     # ===== ADMIN: SET QR CODE =====
@@ -567,9 +615,9 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.message.photo:
             update_setting("qr_code", update.message.photo[-1].file_id)
             context.user_data["waiting_for_qr"] = False
-            await update.message.reply_text("✅ QR Code updated!")
+            await update.message.reply_text("✅ **QR Code updated!**")
         else:
-            await update.message.reply_text("❌ Please send a photo.\n\n❌ /cancel to cancel")
+            await update.message.reply_text("❌ Please send a **photo** (image), not a file.\n\n❌ /cancel to cancel")
         return
     
     # ===== ADMIN: SET HOW TO VIDEO =====
@@ -577,33 +625,33 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.message.video:
             update_setting("how_to_use_video", update.message.video.file_id)
             context.user_data["waiting_for_howto"] = False
-            await update.message.reply_text("✅ How-To video updated!")
+            await update.message.reply_text("✅ **How-To video updated!**")
         else:
-            await update.message.reply_text("❌ Please send a video.\n\n❌ /cancel to cancel")
+            await update.message.reply_text("❌ Please send a **video** file.\n\n❌ /cancel to cancel")
         return
     
     # ===== USER: PAYMENT SCREENSHOT =====
     if context.user_data.get("waiting_for_screenshot"):
         if not update.message.photo:
-            await update.message.reply_text("📸 Please send a screenshot image.")
+            await update.message.reply_text("📸 Please send a **screenshot image** (photo).")
             return
         pending = get_pending_order_by_user(user.id)
         if pending:
-            await update.message.reply_text("⏳ Your payment is already under review.")
+            await update.message.reply_text("⏳ Your payment is already under review.\n\nPlease wait for verification.")
             return
         photo = update.message.photo[-1]
         pkg_id = context.user_data.get("pending_pkg_id")
         p_type = context.user_data.get("pending_type", "number")
         product = get_product(pkg_id) if pkg_id else None
         if not product:
-            await update.message.reply_text("❌ Package not found.")
+            await update.message.reply_text("❌ Package not found. Please start again with /start")
             return
         order_id = create_order(user.id, user.first_name, user.username, p_type, pkg_id, product['name'], 
                                 product['price'], product.get('quantity', 1), product.get('delivery_link', ''), photo.file_id)
         context.user_data["waiting_for_screenshot"] = False
         context.user_data["pending_pkg_id"] = None
         context.user_data["pending_type"] = None
-        await update.message.reply_text("✅ Payment screenshot received!\n\n⏳ Please wait 5–30 minutes while we verify your payment.")
+        await update.message.reply_text("✅ **Payment screenshot received!**\n\n⏳ Please wait 5–30 minutes while we verify your payment.")
         await notify_admins(context, user, product, photo.file_id, p_type, order_id)
         return
 
@@ -652,7 +700,7 @@ async def approve_order(query, context, order_id):
                                            text=f"✅ **Payment Approved!**\n\n🔗 Access Link:\n\n{order.get('delivery_link', '')}")
         except Exception as e:
             logger.error(f"Could not send approval to user {user_id}: {e}")
-    await safe_edit_caption(query, caption=f"✅ Order Approved!\n\n{order['package_name']}\n₹{order['price']}\nUser: {order['first_name']}")
+    await safe_edit_caption(query, caption=f"✅ **Order Approved!**\n\n{order['package_name']}\n₹{order['price']}\nUser: {order['first_name']}")
 
 async def reject_order(query, context, order_id):
     order = get_order(order_id)
@@ -665,7 +713,7 @@ async def reject_order(query, context, order_id):
                                        text="❌ **Payment Rejected.**\nContact support for details.")
     except Exception as e:
         logger.error(f"Could not notify user: {e}")
-    await safe_edit_caption(query, caption=f"❌ Rejected!\n{order['package_name']}\nUser: {order['first_name']}")
+    await safe_edit_caption(query, caption=f"❌ **Rejected!**\n{order['package_name']}\nUser: {order['first_name']}")
 
 async def block_user_from_order(query, context, order_id):
     order = get_order(order_id)
@@ -674,7 +722,7 @@ async def block_user_from_order(query, context, order_id):
         return
     block_user(order["user_id"], order["first_name"], order.get("username", ""))
     update_order_status(order_id, "blocked")
-    await safe_edit_caption(query, caption=f"🚫 Blocked!\n{order['first_name']} (ID: {order['user_id']})")
+    await safe_edit_caption(query, caption=f"🚫 **Blocked!**\n{order['first_name']} (ID: {order['user_id']})")
 
 async def back_to_main(query, context):
     keyboard = [
@@ -685,6 +733,12 @@ async def back_to_main(query, context):
     if query.from_user.id in ADMIN_IDS:
         keyboard.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin_panel")])
     
+    # Delete old message and send new one to avoid issues
+    try:
+        await query.message.delete()
+    except:
+        pass
+    
     welcome_text = (
         "👋 **Welcome back!**\n\n"
         "📱 Buy virtual numbers\n"
@@ -692,7 +746,11 @@ async def back_to_main(query, context):
         "📖 Learn how to use\n\n"
         "Select an option below:"
     )
-    await safe_edit(query, welcome_text, reply_markup=InlineKeyboardMarkup(keyboard))
+    await context.bot.send_message(
+        chat_id=query.message.chat_id,
+        text=welcome_text,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
 # ===================== ADMIN PANEL =====================
 
@@ -883,8 +941,18 @@ def run_health_server():
 
 # ===================== FIXED MAIN (Python 3.14 compatible) =====================
 
+# Global flag for graceful shutdown
+_shutdown = False
+
+def signal_handler(sig, frame):
+    global _shutdown
+    _shutdown = True
+    logger.info("Shutdown signal received, stopping bot...")
+
 async def run_bot():
     """Async function to run the bot"""
+    global _shutdown
+    
     init_db()
     logger.info("Database initialized")
     
@@ -897,24 +965,32 @@ async def run_bot():
     
     logger.info("Bot started successfully!")
     
-    # Use start_polling() directly without run_polling() which calls get_event_loop()
+    # Initialize
     await app.initialize()
     await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
     await app.start()
     
-    # Keep running
+    logger.info("Bot is now polling for updates...")
+    
+    # Keep running until shutdown
     try:
-        while True:
-            await asyncio.sleep(3600)
+        while not _shutdown:
+            await asyncio.sleep(1)
     except asyncio.CancelledError:
         pass
     finally:
+        logger.info("Shutting down bot...")
         await app.updater.stop()
         await app.stop()
         await app.shutdown()
+        logger.info("Bot shutdown complete.")
 
 def main():
-    """Main entry point"""
+    """Main entry point with proper asyncio event loop"""
+    # Register signal handlers for graceful shutdown on Render
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
     # Create and set event loop for Python 3.14 compatibility
     try:
         loop = asyncio.new_event_loop()
@@ -922,11 +998,19 @@ def main():
         loop.run_until_complete(run_bot())
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
     finally:
         try:
+            # Cancel all pending tasks
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
             loop.close()
         except:
             pass
+        logger.info("Main thread exiting.")
 
 if __name__ == "__main__":
     # Start health server in daemon thread
