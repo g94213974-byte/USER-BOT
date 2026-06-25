@@ -45,6 +45,23 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS blocked_users (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, first_name TEXT, username TEXT, blocked_at TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS product_layout (id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT UNIQUE, layout TEXT DEFAULT 'grid')''')
     
+    # ===== NEW: Broadcast tables =====
+    c.execute('''CREATE TABLE IF NOT EXISTS broadcast_schedule (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT,
+        message TEXT,
+        interval_minutes INTEGER DEFAULT 60,
+        enabled INTEGER DEFAULT 0,
+        last_sent TEXT
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS broadcast_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        schedule_id INTEGER,
+        user_id INTEGER,
+        sent_at TEXT,
+        success INTEGER DEFAULT 1
+    )''')
+    
     defaults = {
         "upi_id": "customupi@bank",
         "qr_code": "",
@@ -276,6 +293,95 @@ def count_blocked():
         conn.close()
         return result
 
+# ===================== BROADCAST DATABASE FUNCTIONS =====================
+
+def add_broadcast_schedule(name, message, interval_minutes):
+    with _db_lock:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("INSERT INTO broadcast_schedule (name, message, interval_minutes, enabled, last_sent) VALUES (?, ?, ?, 0, ?)",
+                  (name, message, interval_minutes, None))
+        conn.commit()
+        schedule_id = c.lastrowid
+        conn.close()
+        return schedule_id
+
+def get_broadcast_schedules():
+    with _db_lock:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("SELECT * FROM broadcast_schedule ORDER BY id")
+        results = [dict(row) for row in c.fetchall()]
+        conn.close()
+        return results
+
+def get_broadcast_schedule(schedule_id):
+    with _db_lock:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("SELECT * FROM broadcast_schedule WHERE id = ?", (schedule_id,))
+        row = c.fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+def update_broadcast_schedule(schedule_id, **kwargs):
+    with _db_lock:
+        conn = get_db()
+        c = conn.cursor()
+        sets = []
+        vals = []
+        for k, v in kwargs.items():
+            sets.append(f"{k} = ?")
+            vals.append(v)
+        vals.append(schedule_id)
+        c.execute(f"UPDATE broadcast_schedule SET {', '.join(sets)} WHERE id = ?", vals)
+        conn.commit()
+        conn.close()
+
+def delete_broadcast_schedule(schedule_id):
+    with _db_lock:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("DELETE FROM broadcast_schedule WHERE id = ?", (schedule_id,))
+        conn.commit()
+        conn.close()
+
+def toggle_broadcast(schedule_id, enabled):
+    with _db_lock:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("UPDATE broadcast_schedule SET enabled = ? WHERE id = ?", (1 if enabled else 0, schedule_id))
+        conn.commit()
+        conn.close()
+
+def log_broadcast(schedule_id, user_id, success=True):
+    with _db_lock:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("INSERT INTO broadcast_log (schedule_id, user_id, sent_at, success) VALUES (?, ?, ?, ?)",
+                  (schedule_id, user_id, datetime.datetime.now().isoformat(), 1 if success else 0))
+        conn.commit()
+        conn.close()
+
+def get_all_user_ids():
+    """Get all user IDs from the users table for broadcasting."""
+    with _db_lock:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("SELECT user_id FROM users")
+        results = [row[0] for row in c.fetchall()]
+        conn.close()
+        return results
+
+def get_broadcast_stats(schedule_id):
+    with _db_lock:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) as total, SUM(success) as success, COUNT(*) - SUM(success) as failed FROM broadcast_log WHERE schedule_id = ?", (schedule_id,))
+        row = c.fetchone()
+        conn.close()
+        return dict(row) if row else {"total": 0, "success": 0, "failed": 0}
+
 # ===================== SAFE EDIT =====================
 async def safe_edit(query, text, reply_markup=None):
     try:
@@ -426,6 +532,52 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_users(query, context)
     elif data == "admin_stats":
         await show_stats(query, context)
+    # ===== BROADCAST ADMIN CONTROLS =====
+    elif data == "admin_broadcast":
+        await show_broadcast_panel(query, context)
+    elif data == "admin_broadcast_add":
+        if query.from_user.id in ADMIN_IDS:
+            context.user_data["waiting_for_broadcast_name"] = True
+            await safe_edit(query, "✏️ Enter a **name** for this broadcast schedule:\n\nExample: `Weekly Promotion`\n\n❌ /cancel to cancel")
+    elif data.startswith("broadcast_toggle_"):
+        if query.from_user.id in ADMIN_IDS:
+            parts = data.split("_")
+            sched_id = int(parts[2])
+            sched = get_broadcast_schedule(sched_id)
+            if sched:
+                toggle_broadcast(sched_id, not sched["enabled"])
+            await show_broadcast_panel(query, context)
+    elif data.startswith("broadcast_del_"):
+        if query.from_user.id in ADMIN_IDS:
+            sched_id = int(data.split("_")[2])
+            delete_broadcast_schedule(sched_id)
+            await show_broadcast_panel(query, context)
+    elif data.startswith("broadcast_stats_"):
+        if query.from_user.id in ADMIN_IDS:
+            sched_id = int(data.split("_")[2])
+            stats = get_broadcast_stats(sched_id)
+            sched = get_broadcast_schedule(sched_id)
+            text = f"📊 **Broadcast Stats: {sched['name']}**\n\n"
+            text += f"✅ Sent: {stats['success']}\n"
+            text += f"❌ Failed: {stats['failed']}\n"
+            text += f"📦 Total: {stats['total']}\n"
+            text += f"⏱ Interval: {sched['interval_minutes']} min\n"
+            text += f"🔘 Status: {'🟢 ON' if sched['enabled'] else '🔴 OFF'}"
+            await safe_edit(query, text, reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Back", callback_data="admin_broadcast")]
+            ]))
+    elif data.startswith("broadcast_edit_msg_"):
+        if query.from_user.id in ADMIN_IDS:
+            sched_id = int(data.split("_")[3])
+            context.user_data["editing_broadcast_msg_id"] = sched_id
+            context.user_data["waiting_for_broadcast_msg"] = True
+            await safe_edit(query, "✏️ Send the new broadcast message.\n\nYou can use Markdown formatting.\n\n❌ /cancel to cancel")
+    elif data.startswith("broadcast_edit_interval_"):
+        if query.from_user.id in ADMIN_IDS:
+            sched_id = int(data.split("_")[3])
+            context.user_data["editing_broadcast_interval_id"] = sched_id
+            context.user_data["waiting_for_broadcast_interval"] = True
+            await safe_edit(query, "✏️ Enter the interval in **minutes**:\n\nExample: `60` (for 1 hour)\n`1440` (for 24 hours)\n\n❌ /cancel to cancel")
     # ===== LAYOUT CHANGES =====
     elif data.startswith("set_layout_"):
         if query.from_user.id in ADMIN_IDS:
@@ -614,7 +766,11 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for key in ["waiting_for_upi", "waiting_for_qr", "waiting_for_howto", "waiting_for_demo_link",
                      "waiting_for_screenshot", "waiting_for_num_name", "waiting_for_num_price",
                      "waiting_for_num_qty", "waiting_for_vid_name", "waiting_for_vid_price",
-                     "waiting_for_vid_link", "waiting_for_approval_msg"]:
+                     "waiting_for_vid_link", "waiting_for_approval_msg",
+                     "waiting_for_broadcast_name", "waiting_for_broadcast_message", 
+                     "waiting_for_broadcast_interval", "waiting_for_broadcast_msg",
+                     "editing_broadcast_msg_id", "editing_broadcast_interval_id",
+                     "new_broadcast_name", "new_broadcast_message"]:
             context.user_data[key] = False
         await update.message.reply_text("❌ Cancelled.")
         return
@@ -759,6 +915,76 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_demo_link")]]))
         return
     
+    # ===== ADMIN: ADD BROADCAST NAME =====
+    if context.user_data.get("waiting_for_broadcast_name") and user.id in ADMIN_IDS:
+        name = update.message.text.strip()
+        if len(name) < 2:
+            await update.message.reply_text("❌ Name too short! Use at least 2 characters.\n\n❌ /cancel to cancel")
+            return
+        context.user_data["new_broadcast_name"] = name
+        context.user_data["waiting_for_broadcast_name"] = False
+        context.user_data["waiting_for_broadcast_message"] = True
+        await update.message.reply_text("✏️ Enter the **broadcast message**:\n\nYou can use Markdown formatting.\n\n❌ /cancel to cancel")
+        return
+    
+    if context.user_data.get("waiting_for_broadcast_message") and user.id in ADMIN_IDS:
+        message = update.message.text.strip()
+        if len(message) < 5:
+            await update.message.reply_text("❌ Message too short! Use at least 5 characters.\n\n❌ /cancel to cancel")
+            return
+        context.user_data["new_broadcast_message"] = message
+        context.user_data["waiting_for_broadcast_message"] = False
+        context.user_data["waiting_for_broadcast_interval"] = True
+        await update.message.reply_text("✏️ Enter the **interval in minutes**:\n\nExample: `60` (every hour)\n`1440` (every 24 hours)\n\n❌ /cancel to cancel")
+        return
+    
+    if context.user_data.get("waiting_for_broadcast_interval") and not context.user_data.get("editing_broadcast_interval_id") and user.id in ADMIN_IDS:
+        try:
+            interval = int(update.message.text.strip())
+            if interval < 1:
+                await update.message.reply_text("❌ Interval must be at least 1 minute!\n\n❌ /cancel to cancel")
+                return
+            name = context.user_data.get("new_broadcast_name", "Broadcast")
+            message = context.user_data.get("new_broadcast_message", "")
+            add_broadcast_schedule(name, message, interval)
+            context.user_data["waiting_for_broadcast_interval"] = False
+            await update.message.reply_text(f"✅ **Broadcast schedule created!**\n\n📢 {name}\n⏱ Every {interval} minutes\n\nGo to Admin Panel to enable it.",
+                                           reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Broadcast", callback_data="admin_broadcast")]]))
+        except ValueError:
+            await update.message.reply_text("❌ Invalid number! Send a number like `60`.\n\n❌ /cancel to cancel")
+        return
+    
+    # ===== ADMIN: EDIT BROADCAST MESSAGE =====
+    if context.user_data.get("waiting_for_broadcast_msg") and user.id in ADMIN_IDS:
+        msg = update.message.text.strip()
+        sched_id = context.user_data.get("editing_broadcast_msg_id")
+        if sched_id and len(msg) >= 5:
+            update_broadcast_schedule(sched_id, message=msg)
+            context.user_data["waiting_for_broadcast_msg"] = False
+            context.user_data["editing_broadcast_msg_id"] = None
+            await update.message.reply_text("✅ **Broadcast message updated!**",
+                                           reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Broadcast", callback_data="admin_broadcast")]]))
+        else:
+            await update.message.reply_text("❌ Message too short! Use at least 5 characters.\n\n❌ /cancel to cancel")
+        return
+    
+    # ===== ADMIN: EDIT BROADCAST INTERVAL =====
+    if context.user_data.get("waiting_for_broadcast_interval") and context.user_data.get("editing_broadcast_interval_id") and user.id in ADMIN_IDS:
+        try:
+            interval = int(update.message.text.strip())
+            if interval < 1:
+                await update.message.reply_text("❌ Interval must be at least 1 minute!\n\n❌ /cancel to cancel")
+                return
+            sched_id = context.user_data["editing_broadcast_interval_id"]
+            update_broadcast_schedule(sched_id, interval_minutes=interval)
+            context.user_data["waiting_for_broadcast_interval"] = False
+            context.user_data["editing_broadcast_interval_id"] = None
+            await update.message.reply_text(f"✅ **Interval updated to {interval} minutes!**",
+                                           reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Broadcast", callback_data="admin_broadcast")]]))
+        except ValueError:
+            await update.message.reply_text("❌ Invalid number! Send a number like `60`.\n\n❌ /cancel to cancel")
+        return
+    
     # ===== USER: PAYMENT SCREENSHOT =====
     if context.user_data.get("waiting_for_screenshot"):
         if not update.message.photo:
@@ -884,6 +1110,106 @@ async def back_to_main(query, context):
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
+# ===================== BROADCAST PANEL =====================
+
+async def show_broadcast_panel(query, context):
+    if query.from_user.id not in ADMIN_IDS:
+        return
+    schedules = get_broadcast_schedules()
+    text = "📢 **Broadcast Scheduler**\n\n"
+    
+    if not schedules:
+        text += "No broadcast schedules created yet.\n\nAdd one to start sending periodic messages to all users!"
+    else:
+        for s in schedules:
+            status = "🟢 ON" if s["enabled"] else "🔴 OFF"
+            text += f"• **{s['name']}** [{status}]\n"
+            text += f"  ⏱ Every {s['interval_minutes']} min\n"
+            text += f"  📝 `{s['message'][:50]}{'...' if len(s['message']) > 50 else ''}`\n\n"
+    
+    keyboard = []
+    for s in schedules:
+        row = [
+            InlineKeyboardButton(f"🔄 {'OFF' if s['enabled'] else 'ON'}", callback_data=f"broadcast_toggle_{s['id']}"),
+            InlineKeyboardButton(f"✏️ Msg", callback_data=f"broadcast_edit_msg_{s['id']}"),
+            InlineKeyboardButton(f"⏱ {s['interval_minutes']}m", callback_data=f"broadcast_edit_interval_{s['id']}"),
+            InlineKeyboardButton(f"📊", callback_data=f"broadcast_stats_{s['id']}"),
+            InlineKeyboardButton(f"🗑️", callback_data=f"broadcast_del_{s['id']}")
+        ]
+        keyboard.append(row)
+    
+    keyboard.append([InlineKeyboardButton("➕ Add Broadcast", callback_data="admin_broadcast_add")])
+    keyboard.append([InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")])
+    
+    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+# ===================== BROADCAST SCHEDULER =====================
+
+async def broadcast_scheduler(app: Application):
+    """Background task that checks and sends scheduled broadcasts."""
+    logger.info("Broadcast scheduler started")
+    while not _shutdown:
+        try:
+            schedules = get_broadcast_schedules()
+            now = datetime.datetime.now()
+            
+            for sched in schedules:
+                if not sched["enabled"]:
+                    continue
+                
+                last_sent = sched.get("last_sent")
+                should_send = False
+                
+                if not last_sent:
+                    should_send = True
+                else:
+                    try:
+                        last_time = datetime.datetime.fromisoformat(last_sent)
+                        elapsed = (now - last_time).total_seconds() / 60.0
+                        if elapsed >= sched["interval_minutes"]:
+                            should_send = True
+                    except:
+                        should_send = True
+                
+                if should_send:
+                    logger.info(f"Broadcasting schedule #{sched['id']}: {sched['name']}")
+                    await send_broadcast(app, sched)
+                    
+                    # Update last_sent
+                    update_broadcast_schedule(sched["id"], last_sent=now.isoformat())
+            
+        except Exception as e:
+            logger.error(f"Broadcast scheduler error: {e}")
+        
+        # Check every 30 seconds
+        await asyncio.sleep(30)
+
+async def send_broadcast(app: Application, sched):
+    """Send broadcast message to all users."""
+    user_ids = get_all_user_ids()
+    message = sched["message"]
+    sent_count = 0
+    failed_count = 0
+    
+    logger.info(f"Sending broadcast '{sched['name']}' to {len(user_ids)} users")
+    
+    for uid in user_ids:
+        if _shutdown:
+            break
+        try:
+            await app.bot.send_message(chat_id=uid, text=message, parse_mode='Markdown')
+            log_broadcast(sched["id"], uid, success=True)
+            sent_count += 1
+        except Exception as e:
+            logger.debug(f"Failed to send to {uid}: {e}")
+            log_broadcast(sched["id"], uid, success=False)
+            failed_count += 1
+        
+        # Small delay to avoid hitting Telegram rate limits
+        await asyncio.sleep(0.05)
+    
+    logger.info(f"Broadcast '{sched['name']}' completed: {sent_count} sent, {failed_count} failed")
+
 # ===================== ADMIN PANEL =====================
 
 async def show_admin_panel(query, context):
@@ -897,6 +1223,7 @@ async def show_admin_panel(query, context):
         [InlineKeyboardButton("📖 HowTo Video", callback_data="admin_howto"),
          InlineKeyboardButton("▶️ DEMO Link", callback_data="admin_demo_link")],
         [InlineKeyboardButton("📝 Approval Msg", callback_data="admin_approval_msg")],
+        [InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast")],
         [InlineKeyboardButton("🇮🇳 Num Layout", callback_data="admin_layout_numbers"),
          InlineKeyboardButton("🔞 Vid Layout", callback_data="admin_layout_videos")],
         [InlineKeyboardButton("📦 Pending Orders", callback_data="admin_pending"), 
@@ -1155,6 +1482,10 @@ async def run_bot():
     await app.initialize()
     await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
     await app.start()
+    
+    # ===== START BROADCAST SCHEDULER IN BACKGROUND =====
+    asyncio.create_task(broadcast_scheduler(app))
+    logger.info("Broadcast scheduler background task launched!")
     
     logger.info("Bot is now polling for updates...")
     
